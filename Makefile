@@ -7,7 +7,7 @@ NVCCFLAGS := -O3 -arch=sm_35 -ccbin $(CCBIN) -allow-unsupported-compiler -Xcompi
 LIBS := -lcufft -lstdc++
 
 TARGET_DIR := bin
-TARGET := $(TARGET_DIR)/libdgp_core.so
+TARGET := $(TARGET_DIR)/libsb_core.so
 
 all: $(TARGET)
 
@@ -16,6 +16,6 @@ $(TARGET): src/main.cu
 	$(NVCC) $(NVCCFLAGS) -shared src/main.cu -o $(TARGET) $(LIBS)
 
 clean:
-	rm -rf $(TARGET_DIR)/*
+	rm -f $(TARGET)
 
 .PHONY: all clean

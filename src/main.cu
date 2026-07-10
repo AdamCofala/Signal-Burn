@@ -54,7 +54,7 @@ static cufftHandle get_plan(int n) {
 }
 
 
-int process_iq(const int16_t* interleaved_iq, size_t num_samples, float* out_mag) {
+int sb_process_iq(const int16_t* interleaved_iq, size_t num_samples, float* out_mag) {
     if (num_samples == 0 || num_samples > (size_t)INT32_MAX) return -1;
 
     IQSample* d_in = nullptr;
@@ -107,7 +107,7 @@ int process_iq(const int16_t* interleaved_iq, size_t num_samples, float* out_mag
     return status;
 }
 
-void dgp_shutdown() {
+void sb_shutdown() {
     std::lock_guard<std::mutex> lock(g_plan_mutex);
     for (auto& kv : g_plans) cufftDestroy(kv.second);
     g_plans.clear();
