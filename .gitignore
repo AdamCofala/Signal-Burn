@@ -1,0 +1,25 @@
+# --- Build & Binaries ---
+bin/*
+!bin/.gitkeep
+*.o
+*.d
+*.fatbin
+
+# --- Python ---
+__pycache__/
+*.pyc
+.venv/
+venv/
+.pytest_cache/
+.ipynb_checkpoints/
+.python-version
+
+# --- Data  ---
+*.bin
+dane/
+
+# --- IDE & OS ---
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
