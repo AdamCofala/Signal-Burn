@@ -1,11 +1,27 @@
-import subprocess
-import h5py
-import numpy as np
+import ctypes
 from pathlib import Path
 
+import h5py
+import numpy as np
+
+_lib = None
+
+def _get_lib(lib_path="./bin/libdgp_core.so"):
+    global _lib
+    if _lib is None:
+        _lib = ctypes.CDLL(str(Path(lib_path).resolve()))
+        _lib.process_iq.argtypes = [
+            ctypes.POINTER(ctypes.c_int16),
+            ctypes.c_size_t,
+            ctypes.POINTER(ctypes.c_float),
+        ]
+        _lib.process_iq.restype = ctypes.c_int
+    return _lib
+
+
 class SignalBurnManager:
-    def __init__(self, binary_path="./bin/dgp_core"):
-        self.binary_path = Path(binary_path).resolve()
+    def __init__(self, lib_path="./bin/libdgp_core.so"):
+        self.lib = _get_lib(lib_path)
 
     def run_batch(self, input_dir, output_dir, dataset_name="rf_data"):
         in_path = Path(input_dir)
@@ -21,16 +37,21 @@ class SignalBurnManager:
             raw = f[dataset_name][:]
 
             if raw.dtype.fields and {"r", "i"}.issubset(raw.dtype.fields):
-                data = np.empty(raw.shape[0] * 2, dtype=np.int16)
+                num_samples = raw.shape[0]
+                data = np.empty(num_samples * 2, dtype=np.int16)
                 data[0::2] = raw["r"].astype(np.int16, copy=False).ravel()
                 data[1::2] = raw["i"].astype(np.int16, copy=False).ravel()
             else:
                 data = np.asarray(raw, dtype=np.int16).ravel()
-            size = data.shape[0]
+                num_samples = data.shape[0] // 2
 
-        cmd = [str(self.binary_path), "-", str(output_path), str(size)]
-        
-        proc = subprocess.Popen(cmd, stdin=subprocess.PIPE)
-        proc.stdin.write(data.tobytes())
-        proc.stdin.close()
-        proc.wait()
+        out_mag = np.empty(num_samples, dtype=np.float32)
+
+        data_ptr = data.ctypes.data_as(ctypes.POINTER(ctypes.c_int16))
+        out_ptr = out_mag.ctypes.data_as(ctypes.POINTER(ctypes.c_float))
+
+        ret = self.lib.process_iq(data_ptr, ctypes.c_size_t(num_samples), out_ptr)
+        if ret != 0:
+            raise RuntimeError(f"process_iq failed for {h5_path} (code {ret})")
+
+        out_mag.tofile(output_path)
