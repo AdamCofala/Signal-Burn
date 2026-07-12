@@ -1,7 +1,7 @@
 from pathlib import Path
 import argparse
 
-from .core import SignalBurner
+from SignalBurner import SignalBurner
 
 
 def main(argv=None):
