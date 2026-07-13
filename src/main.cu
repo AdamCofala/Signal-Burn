@@ -3,7 +3,6 @@
 #include <cuda_runtime.h>
 #include <cufft.h>
 #include <math.h>
-#include <float.h>
 #include <unordered_map>
 #include <mutex>
 
@@ -11,7 +10,8 @@ extern "C" {
 
 struct IQSample { int16_t r; int16_t i; };
 
-__global__ void convertInt16ToComplex(const IQSample* in, cufftComplex* out, int size) {
+// Kernel to convert interleaved IQ samples to floats
+__global__ void convert(const IQSample* in, cufftComplex* out, int size) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx < size) {
         out[idx].x = (float)in[idx].r;
@@ -19,120 +19,115 @@ __global__ void convertInt16ToComplex(const IQSample* in, cufftComplex* out, int
     }
 }
 
-__global__ void calcMagnitude(const cufftComplex* in, float* out, int size) {
+// Kernel to compute power spectrum from FFT output
+__global__ void power(const cufftComplex* in, float* out, int size) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx < size) {
-        float real = in[idx].x;
-        float imag = in[idx].y;
-        out[idx] = sqrtf(real * real + imag * imag);
+        float r = in[idx].x;
+        float i = in[idx].y;
+        out[idx] = r * r + i * i;
     }
 }
 
-// Redukcja (max-pool) + fftshift w jednym przejściu.
-__global__ void downsampleShiftedMax(const float* full_mag, float* out_bins, int N, int num_bins) {
-    int bin = blockIdx.x * blockDim.x + threadIdx.x;
-    if (bin >= num_bins) return;
+// Kernel to downsample the power spectrum by averaging
+__global__ void downsample_average(const float* in_pow, float* out_downsampled, int orig_size, int out_size) {
+    int out_idx = blockIdx.x * blockDim.x + threadIdx.x;
 
-    long long start = ((long long)bin * N) / num_bins;
-    long long end   = ((long long)(bin + 1) * N) / num_bins;
-    if (end <= start) end = start + 1;
-    if (end > N) end = N;
+    if (out_idx < out_size) {
+        int factor = orig_size / out_size;
+        int start_idx = out_idx * factor;
+        int end_idx = start_idx + factor;
 
-    float max_val = -FLT_MAX;
-    for (long long shifted_idx = start; shifted_idx < end; shifted_idx++) {
-        long long orig_idx = (shifted_idx + N / 2) % N;  // shifted -> naturalny indeks FFT
-        float v = full_mag[orig_idx];
-        if (v > max_val) max_val = v;
+        if (end_idx > orig_size) end_idx = orig_size;
+
+        double sum = 0.0;
+        for (int i = start_idx; i < end_idx; i++) {
+            sum += in_pow[i];
+        }
+
+        int count = end_idx - start_idx;
+        out_downsampled[out_idx] = (count > 0) ? (float)(sum / count) : 0.0f;
     }
-    out_bins[bin] = max_val;
 }
 
+// Global state for CUDA resources
 static std::unordered_map<int, cufftHandle> g_plans;
-static std::mutex g_plan_mutex;
+static std::mutex g_state_mutex;
+
+static IQSample* g_d_in = nullptr;
+static cufftComplex* g_d_fft = nullptr;
+static float* g_d_pow = nullptr;
+static float* g_d_downsampled = nullptr;
+static int g_allocated_size = 0;
+static int g_allocated_out_size = 0;
 
 static cufftHandle get_plan(int n) {
-    std::lock_guard<std::mutex> lock(g_plan_mutex);
     auto it = g_plans.find(n);
     if (it != g_plans.end()) return it->second;
 
     cufftHandle plan;
     cufftResult r = cufftPlan1d(&plan, n, CUFFT_C2C, 1);
-    if (r != CUFFT_SUCCESS) {
-        fprintf(stderr, "cufftPlan1d failed: %d\n", r);
-        return 0;
-    }
+    if (r != CUFFT_SUCCESS) return 0;
     g_plans[n] = plan;
     return plan;
 }
 
-// out_mag musi miec miejsce na `out_bins` floatow (NIE num_samples floatow!)
-int sb_process_iq(const int16_t* interleaved_iq, size_t num_samples, int out_bins, float* out_mag) {
-    if (num_samples == 0 || num_samples > (size_t)INT32_MAX) return -1;
-    if (out_bins <= 0 || (size_t)out_bins > num_samples) return -7;
 
-    IQSample* d_in = nullptr;
-    cufftComplex* d_fft = nullptr;
-    float* d_mag = nullptr;
-    float* d_out = nullptr;
-    int status = 0;
+int sb_process_iq(const int16_t* interleaved_iq, size_t num_samples, float* out_pow_downsampled, int out_size) {
 
-    do {
+    if (num_samples == 0 || num_samples > (size_t)INT32_MAX || out_size <= 0) return -1;
+    int n = (int)num_samples;
+
+    std::lock_guard<std::mutex> lock(g_state_mutex);
+
+    if (n > g_allocated_size || out_size > g_allocated_out_size) {
+        if (g_d_in)          cudaFree(g_d_in);
+        if (g_d_fft)         cudaFree(g_d_fft);
+        if (g_d_pow)         cudaFree(g_d_pow);
+        if (g_d_downsampled) cudaFree(g_d_downsampled);
+
         cudaError_t err;
-        err = cudaMalloc((void**)&d_in, num_samples * sizeof(IQSample));
-        if (err != cudaSuccess) { fprintf(stderr, "cudaMalloc d_in: %s\n", cudaGetErrorString(err)); status = -2; break; }
+        err = cudaMalloc(&g_d_in, n * sizeof(IQSample));
+        err = cudaMalloc(&g_d_fft, n * sizeof(cufftComplex));
+        err = cudaMalloc(&g_d_pow, n * sizeof(float));
+        err = cudaMalloc(&g_d_downsampled, out_size * sizeof(float));
+        if (err != cudaSuccess) return -10;
 
-        err = cudaMalloc((void**)&d_fft, num_samples * sizeof(cufftComplex));
-        if (err != cudaSuccess) { fprintf(stderr, "cudaMalloc d_fft: %s\n", cudaGetErrorString(err)); status = -2; break; }
+        g_allocated_size = n;
+        g_allocated_out_size = out_size;
+    }
 
-        err = cudaMalloc((void**)&d_mag, num_samples * sizeof(float));
-        if (err != cudaSuccess) { fprintf(stderr, "cudaMalloc d_mag: %s\n", cudaGetErrorString(err)); status = -2; break; }
+    int threads = 256;
+    int blocks = (n + threads - 1) / threads;
 
-        err = cudaMalloc((void**)&d_out, out_bins * sizeof(float));
-        if (err != cudaSuccess) { fprintf(stderr, "cudaMalloc d_out: %s\n", cudaGetErrorString(err)); status = -2; break; }
+    if (cudaMemcpy(g_d_in, interleaved_iq, n * sizeof(IQSample), cudaMemcpyHostToDevice) != cudaSuccess) return -2;
 
-        err = cudaMemcpy(d_in, interleaved_iq, num_samples * sizeof(IQSample), cudaMemcpyHostToDevice);
-        if (err != cudaSuccess) { fprintf(stderr, "H2D copy: %s\n", cudaGetErrorString(err)); status = -3; break; }
+    convert<<<blocks, threads>>>(g_d_in, g_d_fft, n);
+    cufftHandle plan = get_plan(n);
+    if (plan == 0 || cufftExecC2C(plan, g_d_fft, g_d_fft, CUFFT_FORWARD) != CUFFT_SUCCESS) return -3;
 
-        int n = (int)num_samples;
-        int threadsPerBlock = 256;
-        int blocksPerGrid = (n + threadsPerBlock - 1) / threadsPerBlock;
+    power<<<blocks, threads>>>(g_d_fft, g_d_pow, n);
 
-        convertInt16ToComplex<<<blocksPerGrid, threadsPerBlock>>>(d_in, d_fft, n);
-        if ((err = cudaGetLastError()) != cudaSuccess) { fprintf(stderr, "convert kernel: %s\n", cudaGetErrorString(err)); status = -4; break; }
+    int ds_threads = 256;
+    int ds_blocks = (out_size + ds_threads - 1) / ds_threads;
+    downsample_average<<<ds_blocks, ds_threads>>>(g_d_pow, g_d_downsampled, n, out_size);
 
-        cufftHandle plan = get_plan(n);
-        if (plan == 0) { status = -5; break; }
+    if (cudaMemcpy(out_pow_downsampled, g_d_downsampled, out_size * sizeof(float), cudaMemcpyDeviceToHost) != cudaSuccess) return -5;
 
-        cufftResult r = cufftExecC2C(plan, d_fft, d_fft, CUFFT_FORWARD);
-        if (r != CUFFT_SUCCESS) { fprintf(stderr, "cufftExecC2C: %d\n", r); status = -5; break; }
-
-        calcMagnitude<<<blocksPerGrid, threadsPerBlock>>>(d_fft, d_mag, n);
-        if ((err = cudaGetLastError()) != cudaSuccess) { fprintf(stderr, "magnitude kernel: %s\n", cudaGetErrorString(err)); status = -4; break; }
-
-        int binsBlocks = (out_bins + threadsPerBlock - 1) / threadsPerBlock;
-        downsampleShiftedMax<<<binsBlocks, threadsPerBlock>>>(d_mag, d_out, n, out_bins);
-        if ((err = cudaGetLastError()) != cudaSuccess) { fprintf(stderr, "downsample kernel: %s\n", cudaGetErrorString(err)); status = -4; break; }
-
-        err = cudaDeviceSynchronize();
-        if (err != cudaSuccess) { fprintf(stderr, "sync: %s\n", cudaGetErrorString(err)); status = -6; break; }
-
-        err = cudaMemcpy(out_mag, d_out, out_bins * sizeof(float), cudaMemcpyDeviceToHost);
-        if (err != cudaSuccess) { fprintf(stderr, "D2H copy: %s\n", cudaGetErrorString(err)); status = -3; break; }
-
-    } while (false);
-
-    if (d_in)  cudaFree(d_in);
-    if (d_fft) cudaFree(d_fft);
-    if (d_mag) cudaFree(d_mag);
-    if (d_out) cudaFree(d_out);
-
-    return status;
+    return 0;
 }
 
 void sb_shutdown() {
-    std::lock_guard<std::mutex> lock(g_plan_mutex);
+    std::lock_guard<std::mutex> lock(g_state_mutex);
     for (auto& kv : g_plans) cufftDestroy(kv.second);
     g_plans.clear();
+
+    if (g_d_in)  { cudaFree(g_d_in);  g_d_in = nullptr; }
+    if (g_d_fft) { cudaFree(g_d_fft); g_d_fft = nullptr; }
+    if (g_d_pow) { cudaFree(g_d_pow); g_d_pow = nullptr; }
+    if (g_d_downsampled) { cudaFree(g_d_downsampled); g_d_downsampled = nullptr; }
+    g_allocated_size = 0;
+    g_allocated_out_size = 0;
 }
 
 } // extern "C"

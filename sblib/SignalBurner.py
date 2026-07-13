@@ -1,39 +1,42 @@
 import ctypes
-import json
-import queue
-import threading
 from pathlib import Path
-
 import h5py
 import numpy as np
 
 
 class SignalBurner:
+    """
+    Class SignarBurner is responsible for processing I/Q data from HDF5 files
+    using a CUDA library. It loads the data, processes it on the GPU, and optionally
+    saves the results. The class handles loading the CUDA library, managing input and
+    output paths, and ensuring that the data is in the correct format for processing.
+    """
+
     def __init__(
         self,
-        input_path=None,
-        save_files=False,
-        output_path=None,
-        cache_path=None,
-        dataset_name="rf_data",
-        out_bins=2048,
-        lib_path=None,
-    ):
+        input_path=None,  # Input path to the directory containing HDF5 files
+        save_files=False,  # Whether to save the processed files or not
+        output_path=None,  # Output path to save the processed files (if save_files is True)
+        cache_path=None,  # Path to cache intermediate results
+        dataset_name="rf_data",  # Name of the dataset in the HDF5 files to process
+        lib_path=None,  # Path to the CUDA library (if None, defaults to 'bin/libsb_core.so')
+        max_bins=2048,  # Downsampling target number of bins for the output
+    ) -> None:
+
         self.input_path = input_path
         self.output_path = output_path
         self.cache_path = cache_path
         self.dataset_name = dataset_name
         self.save_files = save_files
-        self.out_bins = out_bins
+        self.max_bins = max_bins
 
         self._lib_path = (
             Path(lib_path)
             if lib_path is not None
             else Path(__file__).parent.parent / "bin" / "libsb_core.so"
         )
-        self._lib = None
 
-    # --- properties ---------------------------------------------------
+        self._lib = None
 
     @property
     def input_path(self):
@@ -43,224 +46,107 @@ class SignalBurner:
     def input_path(self, value):
         self._input_path = Path(value) if value is not None else None
 
-    @property
-    def output_path(self):
-        return self._output_path
-
-    @output_path.setter
-    def output_path(self, value):
-        self._output_path = Path(value) if value is not None else None
-
-    @property
-    def cache_path(self):
-        return self._cache_path
-
-    @cache_path.setter
-    def cache_path(self, value):
-        self._cache_path = Path(value) if value is not None else None
-
-    @property
-    def dataset_name(self):
-        return self._dataset_name
-
-    @dataset_name.setter
-    def dataset_name(self, value):
-        self._dataset_name = value
-
-    @property
-    def out_bins(self):
-        return self._out_bins
-
-    @out_bins.setter
-    def out_bins(self, value):
-        if value <= 0:
-            raise ValueError("out_bins musi byc > 0")
-        self._out_bins = value
-
-    # --- biblioteka (cache'owana, lazy) --------------------------------
-
     def load_library(self):
+        """
+        Load the CUDA library for processing I/Q data.
+        """
+
         if self._lib is None:
             if not self._lib_path.exists():
-                raise FileNotFoundError(f"Nie znaleziono biblioteki: {self._lib_path}")
+                raise FileNotFoundError(f"Library not found: {self._lib_path}")
+
             lib = ctypes.CDLL(str(self._lib_path))
+
+            # sb_process_iq: (int16_t* in, size_t num_samples, float* out, int out_size)
             lib.sb_process_iq.argtypes = [
                 ctypes.POINTER(ctypes.c_int16),
                 ctypes.c_size_t,
-                ctypes.c_int,
                 ctypes.POINTER(ctypes.c_float),
+                ctypes.c_int,
             ]
             lib.sb_process_iq.restype = ctypes.c_int
+
+            # sb_shutdown
+            if hasattr(lib, "sb_shutdown"):
+                lib.sb_shutdown.argtypes = []
+                lib.sb_shutdown.restype = None
+
             self._lib = lib
         return self._lib
 
-    # --- cache index (persystentny, JSON) ------------------------------
-
-    def _cache_index_path(self):
-        return self._cache_path / "index.json"
-
-    def _load_cache_index(self):
-        if self._cache_path is None:
-            return {}
-        self._cache_path.mkdir(parents=True, exist_ok=True)
-        idx_path = self._cache_index_path()
-        if not idx_path.exists():
-            return {}
-        try:
-            with open(idx_path, "r") as f:
-                return json.load(f)
-        except (json.JSONDecodeError, OSError):
-            return {}
-
-    def _save_cache_index(self, index):
-        if self._cache_path is None:
-            return
-        idx_path = self._cache_index_path()
-        tmp_path = idx_path.with_suffix(".json.tmp")
-        with open(tmp_path, "w") as f:
-            json.dump(index, f)
-        tmp_path.replace(idx_path)
-
-    def _fingerprint(self, h5_path):
-        stat = h5_path.stat()
-        return {"size": stat.st_size, "mtime": stat.st_mtime}
-
-    def _is_cached(self, h5_path, index):
-        entry = index.get(h5_path.name)
-        if entry is None:
-            return False
-        fp = self._fingerprint(h5_path)
-        if entry.get("size") != fp["size"] or entry.get("mtime") != fp["mtime"]:
-            return False
-        out_bin_path = Path(entry.get("output", ""))
-        return out_bin_path.exists()
-
-    def _prune_stale_cache(self, index, current_names):
-        stale = [name for name in index if name not in current_names]
-        for name in stale:
-            del index[name]
-        return index
-
-    # --- wczytywanie IQ z h5 -------------------------------------------
-
-    def _load_iq_data(self, h5_path):
+    def load_iq_data(self, h5_path):
         with h5py.File(h5_path, "r") as f:
-            if self._dataset_name not in f:
-                raise KeyError(
-                    f"Dataset '{self._dataset_name}' nie istnieje w {h5_path}"
-                )
-            raw = f[self._dataset_name][:]
-
-        raw = raw.ravel()
+            raw = f[self.dataset_name][:]
 
         if raw.dtype.fields and {"r", "i"}.issubset(raw.dtype.fields):
             num_samples = raw.shape[0]
             data = np.empty(num_samples * 2, dtype=np.int16)
-            data[0::2] = raw["r"].astype(np.int16, copy=False)
-            data[1::2] = raw["i"].astype(np.int16, copy=False)
+            data[0::2] = raw["r"].ravel()
+            data[1::2] = raw["i"].ravel()
         else:
-            data = np.ascontiguousarray(raw, dtype=np.int16)
-            num_samples = data.shape[0] // 2
+            data = np.asarray(raw, dtype=np.int16).ravel()
+            if data.size % 2 != 0:
+                raise ValueError(
+                    "I/Q data size is not even, cannot reshape into complex pairs."
+                )
 
         if not data.flags["C_CONTIGUOUS"]:
             data = np.ascontiguousarray(data)
 
-        return data, num_samples
+        return data, data.size // 2
 
-    # --- przetwarzanie jednego pliku ------------------------------------
-
-    def _run_gpu(self, data, num_samples):
+    def run_gpu(self, data, num_samples) -> np.ndarray:
         lib = self.load_library()
-        out_mag = np.empty(self._out_bins, dtype=np.float32)
+
+        out_mag = np.empty(self.max_bins, dtype=np.float32)
 
         data_ptr = data.ctypes.data_as(ctypes.POINTER(ctypes.c_int16))
         out_ptr = out_mag.ctypes.data_as(ctypes.POINTER(ctypes.c_float))
 
         ret = lib.sb_process_iq(
-            data_ptr,
-            ctypes.c_size_t(num_samples),
-            ctypes.c_int(self._out_bins),
-            out_ptr,
+            data_ptr, ctypes.c_size_t(num_samples), out_ptr, ctypes.c_int(self.max_bins)
         )
+
         if ret != 0:
-            raise RuntimeError(f"sb_process_iq failed (code {ret})")
+            raise RuntimeError(f"sb_process_iq failed ( {ret})")
+
         return out_mag
 
     def process_file(self, h5_path):
-        data, num_samples = self._load_iq_data(h5_path)
+        data, num_samples = self.load_iq_data(h5_path)
+
         if num_samples == 0:
-            raise ValueError(f"Brak probek IQ w {h5_path}")
-        return self._run_gpu(data, num_samples)
+            raise ValueError(f"File {h5_path} contains no samples.")
 
-    # --- generator z overlapem I/O <-> GPU ------------------------------
+        return self.run_gpu(data, num_samples)
 
-    def process_files(self):
+    def shutdown(self):
+        """
+        Shutdown the CUDA library and free GPU resources.
+        Really important to call this after processing ALL files,
+        the CUDA library was designed to allocate GPU resources once and
+        reuse them for all files for faster processing. If you call this after each file,
+        it will drasticly decrease performance because of reallocation gpu resources.
+        """
+        lib = self.load_library()
+        if hasattr(lib, "sb_shutdown"):
+            lib.sb_shutdown()
+
+    def run(self) -> list[tuple[Path, np.ndarray]]:
         if self._input_path is None:
-            raise ValueError("input_path nie jest ustawiony")
+            raise ValueError("input_path is not set.")
 
-        index = self._load_cache_index()
-        h5_files = sorted(self._input_path.glob("*.h5"))
-        current_names = {p.name for p in h5_files}
-        index = self._prune_stale_cache(index, current_names)
+        h5_files = list(self._input_path.glob("*.h5"))
+        # If u want u can sort them by name or date here
+        # Example: h5_files = sorted(h5_files, key=lambda x: x.name)
+        results = []
 
-        to_process = []
-        for h5_path in h5_files:
-            if self._is_cached(h5_path, index):
-                # szybka sciezka: wynik juz na dysku, maly plik, czytamy inline
-                out_bin_path = Path(index[h5_path.name]["output"])
-                yield h5_path, np.fromfile(out_bin_path, dtype=np.float32)
-            else:
-                to_process.append(h5_path)
+        for i, h5_path in enumerate(h5_files):
+            try:
+                mag = self.process_file(h5_path)
+                print(f"Processed {h5_path.name}: {i + 1}/{len(h5_files)}")
+                results.append((h5_path, mag))
+            except Exception as e:
+                print(f"Error {h5_path.name}: {e}")
 
-        if not to_process:
-            self._save_cache_index(index)
-            return
-
-        # producer: czyta+konwertuje kolejne pliki w tle, podczas gdy GPU liczy poprzedni
-        read_queue = queue.Queue(maxsize=2)
-        SENTINEL = object()
-
-        def producer():
-            for h5_path in to_process:
-                try:
-                    data, num_samples = self._load_iq_data(h5_path)
-                    read_queue.put((h5_path, data, num_samples, None))
-                except Exception as e:
-                    read_queue.put((h5_path, None, None, e))
-            read_queue.put(SENTINEL)
-
-        thread = threading.Thread(target=producer, daemon=True)
-        thread.start()
-
-        try:
-            while True:
-                item = read_queue.get()
-                if item is SENTINEL:
-                    break
-                h5_path, data, num_samples, err = item
-                if err is not None:
-                    raise err
-
-                out_mag = self._run_gpu(data, num_samples)
-
-                if self.save_files:
-                    if self._output_path is None:
-                        raise ValueError(
-                            "save_files=True wymaga ustawionego output_path"
-                        )
-                    self._output_path.mkdir(parents=True, exist_ok=True)
-                    out_file = self._output_path / f"{h5_path.stem}.bin"
-                    out_mag.tofile(out_file)
-
-                    index[h5_path.name] = {
-                        **self._fingerprint(h5_path),
-                        "output": str(out_file),
-                    }
-
-                yield h5_path, out_mag
-        finally:
-            self._save_cache_index(index)
-            thread.join(timeout=1.0)
-
-    def run(self):
-        return list(self.process_files())
+        return results

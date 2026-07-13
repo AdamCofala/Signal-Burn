@@ -1,88 +1,68 @@
-"""
-Testowy skrypt: generuje spektrogram (czas x czestotliwosc) na podstawie
-folderu plikow .h5 przy uzyciu SignalBurner.
-"""
-
 import time
-from pathlib import Path
-
 import matplotlib.pyplot as plt
 import numpy as np
+from pathlib import Path
+from sblib.SignalBurner import SignalBurner
 
-from sblib.SignalBurner import (
-    SignalBurner,
-)  # dopasuj import do faktycznej lokalizacji klasy
 
-INPUT_DIR = Path("/pool/signal_storage/hf25/cha1/2026-07-12T10-00-00/")
-CACHE_PATH = Path("/pool/signal_storage/cache")
-OUTPUT_PATH = INPUT_DIR / "processed"
-
-DATASET_NAME = "rf_data"
-OUT_BINS = 2048
+INPUT_DIR = Path("/pool/signal_storage/hf25/cha1/2026-07-13T08-00-00")
+MAX_FREQ_BINS = 500_000
 FS = 25_000_000
-SAVE_FILES = False
-OUT_PNG = "spectrogram.png"
-LIB_PATH = None  # None -> domyslna sciezka z SignalBurner (obok modulu)
+OUT_PNG = "spectrogram_final.png"
 
 
 def main():
-    if not INPUT_DIR.exists():
-        raise SystemExit(f"Folder nie istnieje: {INPUT_DIR}")
+    print(f"Inicjalizacja SignalBurner (MAX_BINS={MAX_FREQ_BINS})...")
 
-    sb = SignalBurner(
-        input_path=INPUT_DIR,
-        save_files=SAVE_FILES,
-        output_path=OUTPUT_PATH,
-        cache_path=CACHE_PATH,
-        dataset_name=DATASET_NAME,
-        out_bins=OUT_BINS,
-        lib_path=LIB_PATH,
-    )
+    sb = SignalBurner(input_path=INPUT_DIR, max_bins=MAX_FREQ_BINS)
 
-    print(f"Przetwarzanie folderu: {INPUT_DIR}")
-    print(f"out_bins={OUT_BINS}  fs={FS:.0f} Hz  save_files={SAVE_FILES}")
-
-    columns = []
-    file_names = []
-
+    print("Rozpoczynam przetwarzanie (GPU Accelerated)...")
     t_start = time.perf_counter()
 
-    for i, (h5_path, mag) in enumerate(sb.process_files()):
-        columns.append(mag)
-        file_names.append(h5_path.name)
-        elapsed = time.perf_counter() - t_start
-        print(f"  [{i + 1}] {h5_path.name}  ({elapsed:.2f}s od startu)")
+    results = sb.run()
 
     t_total = time.perf_counter() - t_start
 
-    if not columns:
-        raise SystemExit("Brak plikow .h5 do przetworzenia w podanym folderze.")
+    if not results:
+        print("Brak wyników do wyświetlenia.")
+        return
 
     print(
-        f"\nPrzetworzono {len(columns)} plikow w {t_total:.2f}s "
-        f"({t_total / len(columns):.3f}s/plik)"
+        f"Przetworzono {len(results)} plików w {t_total:.2f}s. ({len(results) / t_total:.2f} plików/s)"
     )
+    print("Budowanie macierzy spektrogramu...")
 
-    # (out_bins, num_files) - kazda kolumna to jeden plik/sekunda
+    columns = [res[1] for res in results]
     spectrogram = np.stack(columns, axis=1)
 
-    # magnitude -> dB, zabezpieczone przed log(0)
-    spectrogram_db = 20 * np.log10(spectrogram + 1e-6)
+    spectrogram_db = 10 * np.log10(spectrogram + 1e-6)
 
-    freqs_mhz = np.linspace(-FS / 2, FS / 2, OUT_BINS) / 1e6
-    time_axis_s = np.arange(len(columns))  # 1 plik = 1 sekunda
+    print("Renderowanie wykresu...")
+    plt.figure(figsize=(16, 9))
 
-    plt.figure(figsize=(14, 6))
+    freqs_mhz = np.linspace(0, FS, MAX_FREQ_BINS) / 1e6
     plt.pcolormesh(
-        time_axis_s, freqs_mhz, spectrogram_db, shading="auto", cmap="viridis"
+        range(len(results)),
+        freqs_mhz,
+        spectrogram_db,
+        shading="auto",
+        cmap="jet",
+        vmin=np.percentile(spectrogram_db, 5),
+        vmax=np.percentile(spectrogram_db, 95),
     )
-    plt.xlabel("Czas [s] (1 plik = 1s)")
-    plt.ylabel("Czestotliwosc [MHz]")
-    plt.colorbar(label="Magnitude [dB]")
-    plt.title(f"Spektrogram: {INPUT_DIR.name} ({len(columns)} plikow)")
-    plt.tight_layout()
-    plt.savefig(OUT_PNG, dpi=150)
-    print(f"Zapisano spektrogram: {OUT_PNG}")
+
+    plt.xlabel("Time [s]")
+    plt.ylabel("Frequency [MHz]")
+    plt.colorbar(label="Power [dB]")
+    plt.title(f"{INPUT_DIR.name} | {len(results)} plików ")
+
+    plt.savefig(OUT_PNG, dpi=300)
+    plt.show()
+    print(f"Zapisano wykres: {OUT_PNG}")
+    plt.close()
+
+    sb.shutdown()
+    print("Zasoby GPU zwolnione.")
 
 
 if __name__ == "__main__":
