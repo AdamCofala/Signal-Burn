@@ -2,6 +2,7 @@ import ctypes
 from pathlib import Path
 import h5py
 import numpy as np
+import os
 
 
 class SignalBurner:
@@ -18,17 +19,27 @@ class SignalBurner:
         save_files=False,  # Whether to save the processed files or not
         output_path=None,  # Output path to save the processed files (if save_files is True)
         cache_path=None,  # Path to cache intermediate results
-        dataset_name="rf_data",  # Name of the dataset in the HDF5 files to process
+        dataset_name=None,  # Name of the dataset in the HDF5 files to process
         lib_path=None,  # Path to the CUDA library (if None, defaults to 'bin/libsb_core.so')
         fft_size=8192,  # FFT window size for processing (number of bins)
+        use_cache=True,  # Whether to use caching for intermediate results
     ) -> None:
 
         self.input_path = input_path
         self.output_path = output_path
-        self.cache_path = cache_path
-        self.dataset_name = dataset_name
+        self.cache_path = (
+            Path(cache_path)
+            if cache_path is not None
+            else Path(__file__).parent.parent / "cache"
+        )
+        self.dataset_name = (
+            dataset_name
+            if dataset_name is not None
+            else print("Dataset name not provided.")
+        )
         self.save_files = save_files
         self.fft_size = fft_size
+        self.use_cache = use_cache
 
         self._lib_path = (
             Path(lib_path)
@@ -112,13 +123,43 @@ class SignalBurner:
 
         return out_mag
 
-    def process_file(self, h5_path):
+    def get_cache_file(self, h5_path):
+        if self.cache_path is None:
+            print("Cache path is not set. Caching is disabled.")
+            return None
+
+        self.cache_path.mkdir(parents=True, exist_ok=True)
+        cache_file = self.cache_path / f"{h5_path.stem}_fft{self.fft_size}.npy"
+        return cache_file
+
+    def is_cache_valid(self, h5_path: Path, cache_file: Path) -> bool:
+        if not cache_file.exists():
+            return False
+        src_mtime = os.path.getmtime(h5_path)
+        cache_mtime = os.path.getmtime(cache_file)
+        return cache_mtime >= src_mtime
+
+    def process_file(self, h5_path: Path) -> np.ndarray:
+
+        if self.use_cache:
+            cache_file = self.get_cache_file(h5_path)
+            if cache_file and self.is_cache_valid(h5_path, cache_file):
+                print(f"Loading cached result for {h5_path.name}...")
+                return np.load(cache_file)
+
         data, num_samples = self.load_iq_data(h5_path)
 
         if num_samples == 0:
             raise ValueError(f"File {h5_path} contains no samples.")
 
-        return self.run_gpu(data, num_samples)
+        out = self.run_gpu(data, num_samples)
+
+        if self.use_cache:
+            cache_file = self.get_cache_file(h5_path)
+            if cache_file:
+                np.save(cache_file, out)
+
+        return out
 
     def shutdown(self):
         """
@@ -150,3 +191,17 @@ class SignalBurner:
                 print(f"Error {h5_path.name}: {e}")
 
         return results
+
+    def clean_cache(self, max_age_days: int = 30) -> int:
+        if self.cache_path is None or not self.cache_path.exists():
+            return 0
+
+        import time
+
+        now = time.time()
+        deleted = 0
+        for f in self.cache_path.glob("*.npy"):
+            if now - f.stat().st_mtime > max_age_days * 86400:
+                f.unlink()
+                deleted += 1
+        return deleted

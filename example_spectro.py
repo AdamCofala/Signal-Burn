@@ -4,7 +4,7 @@ import numpy as np
 from pathlib import Path
 from sblib.SignalBurner import SignalBurner
 
-INPUT_DIR = Path("/pool/signal_storage/hf25/cha1/2026-07-14T09-00-00")
+INPUT_DIR = Path("/pool/signal_storage/hf25/cha1/2026-07-14T10-00-00")
 
 FFT_SIZE = 262144
 FS = 25_000_000
@@ -13,7 +13,13 @@ OUT_PNG = "spectrogram_final.png"
 
 def main():
     print(f"Init SignalBurner (FFT_SIZE={FFT_SIZE})...")
-    sb = SignalBurner(input_path=INPUT_DIR, fft_size=FFT_SIZE)
+    sb = SignalBurner(
+        input_path=INPUT_DIR,
+        cache_path=Path("/pool/signal_storage/cache"),
+        dataset_name="rf_data",
+        use_cache=True,
+        fft_size=FFT_SIZE,
+    )
 
     print("Starting processing (GPU Accelerated)...")
     t_start = time.perf_counter()
