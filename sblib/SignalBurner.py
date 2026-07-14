@@ -20,7 +20,7 @@ class SignalBurner:
         cache_path=None,  # Path to cache intermediate results
         dataset_name="rf_data",  # Name of the dataset in the HDF5 files to process
         lib_path=None,  # Path to the CUDA library (if None, defaults to 'bin/libsb_core.so')
-        max_bins=2048,  # Downsampling target number of bins for the output
+        fft_size=8192,  # FFT window size for processing (number of bins)
     ) -> None:
 
         self.input_path = input_path
@@ -28,7 +28,7 @@ class SignalBurner:
         self.cache_path = cache_path
         self.dataset_name = dataset_name
         self.save_files = save_files
-        self.max_bins = max_bins
+        self.fft_size = fft_size
 
         self._lib_path = (
             Path(lib_path)
@@ -57,14 +57,14 @@ class SignalBurner:
 
             lib = ctypes.CDLL(str(self._lib_path))
 
-            # sb_process_iq: (int16_t* in, size_t num_samples, float* out, int out_size)
-            lib.sb_process_iq.argtypes = [
+            # sb_process_fft: (int16_t* in, size_t num_samples, float* out, int fft_size)
+            lib.sb_process_fft.argtypes = [
                 ctypes.POINTER(ctypes.c_int16),
                 ctypes.c_size_t,
                 ctypes.POINTER(ctypes.c_float),
                 ctypes.c_int,
             ]
-            lib.sb_process_iq.restype = ctypes.c_int
+            lib.sb_process_fft.restype = ctypes.c_int
 
             # sb_shutdown
             if hasattr(lib, "sb_shutdown"):
@@ -98,17 +98,17 @@ class SignalBurner:
     def run_gpu(self, data, num_samples) -> np.ndarray:
         lib = self.load_library()
 
-        out_mag = np.empty(self.max_bins, dtype=np.float32)
+        out_mag = np.empty(self.fft_size, dtype=np.float32)
 
         data_ptr = data.ctypes.data_as(ctypes.POINTER(ctypes.c_int16))
         out_ptr = out_mag.ctypes.data_as(ctypes.POINTER(ctypes.c_float))
 
-        ret = lib.sb_process_iq(
-            data_ptr, ctypes.c_size_t(num_samples), out_ptr, ctypes.c_int(self.max_bins)
+        ret = lib.sb_process_fft(
+            data_ptr, ctypes.c_size_t(num_samples), out_ptr, ctypes.c_int(self.fft_size)
         )
 
         if ret != 0:
-            raise RuntimeError(f"sb_process_iq failed ( {ret})")
+            raise RuntimeError(f"sb_process_fft failed ( {ret})")
 
         return out_mag
 
@@ -138,7 +138,7 @@ class SignalBurner:
 
         h5_files = list(self._input_path.glob("*.h5"))
         # If u want u can sort them by name or date here
-        # Example: h5_files = sorted(h5_files, key=lambda x: x.name)
+        h5_files = sorted(h5_files, key=lambda x: x.name)
         results = []
 
         for i, h5_path in enumerate(h5_files):
