@@ -3,6 +3,7 @@ from pathlib import Path
 import h5py
 import numpy as np
 import os
+import time
 
 
 class SignalBurner:
@@ -23,6 +24,7 @@ class SignalBurner:
         lib_path=None,  # Path to the CUDA library (if None, defaults to 'bin/libsb_core.so')
         fft_size=8192,  # FFT window size for processing (number of bins)
         use_cache=True,  # Whether to use caching for intermediate results
+        show_logs=False,  # Whether to show logs during processing
     ) -> None:
 
         self.input_path = input_path
@@ -40,6 +42,7 @@ class SignalBurner:
         self.save_files = save_files
         self.fft_size = fft_size
         self.use_cache = use_cache
+        self.show_logs = show_logs
 
         self._lib_path = (
             Path(lib_path)
@@ -57,7 +60,7 @@ class SignalBurner:
     def input_path(self, value):
         self._input_path = Path(value) if value is not None else None
 
-    def load_library(self):
+    def load_library(self) -> ctypes.CDLL:
         """
         Load the CUDA library for processing I/Q data.
         """
@@ -85,7 +88,7 @@ class SignalBurner:
             self._lib = lib
         return self._lib
 
-    def load_iq_data(self, h5_path):
+    def load_iq_data(self, h5_path: Path) -> tuple[np.ndarray, int]:
         with h5py.File(h5_path, "r") as f:
             raw = f[self.dataset_name][:]
 
@@ -106,7 +109,7 @@ class SignalBurner:
 
         return data, data.size // 2
 
-    def run_gpu(self, data, num_samples) -> np.ndarray:
+    def run_gpu(self, data, num_samples: int) -> np.ndarray:
         lib = self.load_library()
 
         out_mag = np.empty(self.fft_size, dtype=np.float32)
@@ -123,9 +126,10 @@ class SignalBurner:
 
         return out_mag
 
-    def get_cache_file(self, h5_path):
+    def get_cache_file(self, h5_path: Path) -> Path | None:
         if self.cache_path is None:
-            print("Cache path is not set. Caching is disabled.")
+            if self.show_logs:
+                print("Cache path is not set. Caching is disabled.")
             return None
 
         self.cache_path.mkdir(parents=True, exist_ok=True)
@@ -144,7 +148,8 @@ class SignalBurner:
         if self.use_cache:
             cache_file = self.get_cache_file(h5_path)
             if cache_file and self.is_cache_valid(h5_path, cache_file):
-                print(f"Loading cached result for {h5_path.name}...")
+                if self.show_logs:
+                    print(f"Loading cached result for {h5_path.name}...")
                 return np.load(cache_file)
 
         data, num_samples = self.load_iq_data(h5_path)
@@ -161,7 +166,7 @@ class SignalBurner:
 
         return out
 
-    def shutdown(self):
+    def shutdown(self) -> None:
         """
         Shutdown the CUDA library and free GPU resources.
         Really important to call this after processing ALL files,
@@ -172,6 +177,8 @@ class SignalBurner:
         lib = self.load_library()
         if hasattr(lib, "sb_shutdown"):
             lib.sb_shutdown()
+
+        # self.clean_cache(10) - Cleaning cache here is optional
 
     def run(self) -> list[tuple[Path, np.ndarray]]:
         if self._input_path is None:
@@ -185,23 +192,22 @@ class SignalBurner:
         for i, h5_path in enumerate(h5_files):
             try:
                 mag = self.process_file(h5_path)
-                print(f"Processed {h5_path.name}: {i + 1}/{len(h5_files)}")
+                if self.show_logs:
+                    print(f"Processed {h5_path.name}: {i + 1}/{len(h5_files)}")
                 results.append((h5_path, mag))
             except Exception as e:
                 print(f"Error {h5_path.name}: {e}")
 
         return results
 
-    def clean_cache(self, max_age_days: int = 30) -> int:
+    def clean_cache(self, max_age_minutes: int = 30) -> int:
         if self.cache_path is None or not self.cache_path.exists():
             return 0
-
-        import time
 
         now = time.time()
         deleted = 0
         for f in self.cache_path.glob("*.npy"):
-            if now - f.stat().st_mtime > max_age_days * 86400:
+            if now - f.stat().st_mtime > max_age_minutes * 60:
                 f.unlink()
                 deleted += 1
         return deleted

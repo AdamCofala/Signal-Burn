@@ -1,10 +1,13 @@
 import time
 import matplotlib.pyplot as plt
+import matplotlib
+
+matplotlib.use("Agg")
 import numpy as np
 from pathlib import Path
 from sblib.SignalBurner import SignalBurner
 
-INPUT_DIR = Path("/pool/signal_storage/hf25/cha1/2026-07-14T10-00-00")
+INPUT_DIR = Path("/pool/signal_storage/hf25/cha1/2026-07-14T18-00-00")
 
 FFT_SIZE = 262144
 FS = 25_000_000
@@ -28,6 +31,7 @@ def main():
 
     print("Shutting down SignalBurner...")
     sb.shutdown()
+    # sb.clean_cache(10)
 
     t_total = time.perf_counter() - t_start
 
