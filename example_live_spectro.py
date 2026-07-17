@@ -1,49 +1,40 @@
-#!/usr/bin/env python3
-"""
-Live spectrogram – 5-minute rolling window, updates every 0.5 s.
-PyQt5 + pyqtgraph (software render). Background file processing via QTimer.
-"""
+"""Live rolling spectrogram (PyQt5). Updates every 0.5 s."""
 
-import sys
-import time
-import re
-import threading
+import argparse
+import sys, time, re, threading
 from pathlib import Path
-
 import numpy as np
 import pyqtgraph as pg
 import matplotlib.cm as cm
 from PyQt5.QtCore import QThread, pyqtSignal, QTimer, QRectF
 from PyQt5.QtWidgets import QApplication, QMainWindow, QVBoxLayout, QWidget
-
 from sblib.SignalBurner import SignalBurner
 
-# ---------- config ----------
+# ---------- defaults ----------
 INPUT_ROOT = Path("/pool/signal_storage/hf25/cha1")
 CACHE_DIR = Path("/pool/signal_storage/cache")
 FFT_SIZE = 262144
-FS = 25_000_000  # Hz
+FS = 25_000_000
 WINDOW_MINUTES = 5.0
-UPDATE_INTERVAL = 0.5  # seconds
+UPDATE_INTERVAL = 0.5
 DATASET_NAME = "rf_data"
 CLEAR_INPUT_FOLDER = True
 SAVE_PNG = False
 OUTPUT_FILE = Path("./live_spectrogram.png")
-DOWNSAMPLE_DISPLAY = 1  # keep every N-th file
-# ----------------------------
+DOWNSAMPLE_DISPLAY = 1
+# ------------------------------
 
 
 def latest_input_dir(base_dir: Path) -> Path:
     if not base_dir.exists():
         return base_dir
-    subdirs = [path for path in base_dir.iterdir() if path.is_dir()]
+    subdirs = [p for p in base_dir.iterdir() if p.is_dir()]
     if not subdirs:
         return base_dir
-    return max(subdirs, key=lambda path: (path.stat().st_mtime, path.name))
+    return max(subdirs, key=lambda p: (p.stat().st_mtime, p.name))
 
 
 def parse_timestamp(filename: Path) -> float:
-    """Extract UNIX timestamp from filename like rf@123456789.123"""
     m = re.match(r"rf@(\d+)\.(\d+)", filename.stem)
     if not m:
         raise ValueError(f"Invalid filename: {filename.name}")
@@ -51,9 +42,7 @@ def parse_timestamp(filename: Path) -> float:
 
 
 class Worker(QThread):
-    """Process new .h5 files in the background, driven by a timer."""
-
-    data_ready = pyqtSignal(object)  # (times, spectra_matrix)
+    data_ready = pyqtSignal(object)
 
     def __init__(
         self, input_dir, cache_dir, fft_size, dataset_name, window_seconds, clear_input
@@ -68,12 +57,11 @@ class Worker(QThread):
         self.sb = None
         self.timer = None
         self.processed = set()
-        self.history = []  # (timestamp, spectrum)
+        self.history = []
 
     def run(self):
         if not self.input_dir.exists():
             print(f"[Worker] WARNING: input directory missing: {self.input_dir}")
-
         self.sb = SignalBurner(
             fft_size=self.fft_size,
             dataset_name=self.dataset_name,
@@ -82,7 +70,6 @@ class Worker(QThread):
             show_logs=True,
         )
         print("[Worker] SignalBurner ready.")
-
         if self.clear_input and self.input_dir.exists():
             print(f"[Worker] Clearing input directory: {self.input_dir}")
             for f in self.input_dir.glob("*.h5"):
@@ -91,12 +78,10 @@ class Worker(QThread):
                     print(f"  removed {f.name}")
                 except Exception as e:
                     print(f"  error removing {f.name}: {e}")
-
         self.timer = QTimer()
         self.timer.timeout.connect(self.check_for_new_files)
-        self.timer.start(500)  # poll every 500 ms
-        self.exec_()  # start thread's event loop
-
+        self.timer.start(500)
+        self.exec_()
         self.sb.shutdown()
         print("[Worker] Stopped.")
 
@@ -109,36 +94,28 @@ class Worker(QThread):
                 file_entries.append((fp, ts))
             except ValueError:
                 continue
-
         if not file_entries:
             return
-
-        # reference time = latest file
         latest_ts = max(ts for _, ts in file_entries)
         cutoff = latest_ts - self.window_seconds
         window_files = [(fp, ts) for fp, ts in file_entries if ts >= cutoff]
-
         new_count = 0
         for fp, ts in window_files:
-            stem = fp.stem
-            if stem not in self.processed:
+            if fp.stem not in self.processed:
                 try:
                     mag = self.sb.process_file(fp)
-                    self.processed.add(stem)
+                    self.processed.add(fp.stem)
                     self.history.append((ts, mag))
                     new_count += 1
                 except Exception as e:
                     print(f"[Worker] Error processing {fp.name}: {e}")
-
-        # keep only current window
         self.history = [(t, s) for t, s in self.history if t >= cutoff]
         self.history.sort(key=lambda x: x[0])
-
         if new_count > 0 and self.history:
             times = [t for t, _ in self.history]
             spectra = [s for _, s in self.history]
             if len(set(s.shape for s in spectra)) != 1:
-                print("[Worker] Error: inconsistent spectrum shapes")
+                print("[Worker] Inconsistent spectrum shapes")
             else:
                 spec_matrix = np.stack(spectra, axis=0)
                 self.data_ready.emit((times, spec_matrix))
@@ -153,12 +130,24 @@ class Worker(QThread):
 
 
 class MainWindow(QMainWindow):
-    def __init__(self):
+    def __init__(
+        self,
+        input_dir,
+        cache_dir,
+        fft_size,
+        dataset_name,
+        window_seconds,
+        fs,
+        downsample,
+    ):
         super().__init__()
-        self.setWindowTitle("Live Spectrogram – pyqtgraph")
+        self.setWindowTitle("Live Spectrogram - pyqtgraph")
         self.setGeometry(100, 100, 1200, 600)
+        self.fs = fs
+        self.window_seconds = window_seconds
+        self.downsample = downsample
 
-        self.input_dir = latest_input_dir(INPUT_ROOT)
+        self.input_dir = latest_input_dir(input_dir)
         print(f"[GUI] Using input directory: {self.input_dir}")
 
         self.central_widget = QWidget()
@@ -171,10 +160,9 @@ class MainWindow(QMainWindow):
         self.plot_widget.setLabel("bottom", "Time", units="s", color="w")
         self.plot_widget.setAspectLocked(False)
         self.plot_widget.setBackground("k")
-        self.plot_widget.getAxis("left").setPen("w")
-        self.plot_widget.getAxis("left").setTextPen("w")
-        self.plot_widget.getAxis("bottom").setPen("w")
-        self.plot_widget.getAxis("bottom").setTextPen("w")
+        for axis in ("left", "bottom"):
+            self.plot_widget.getAxis(axis).setPen("w")
+            self.plot_widget.getAxis(axis).setTextPen("w")
         self.plot_widget.showGrid(x=True, y=True, alpha=0.3)
 
         self.img_item = pg.ImageItem()
@@ -184,8 +172,8 @@ class MainWindow(QMainWindow):
         self.img_item.setLookupTable(jet_cmap.astype(np.uint8))
         self.img_item.setAutoDownsample(True)
 
-        self.plot_widget.setXRange(-WINDOW_MINUTES * 60, 0, padding=0)
-        self.plot_widget.setYRange(0, FS / 1e6, padding=0)
+        self.plot_widget.setXRange(-window_seconds, 0, padding=0)
+        self.plot_widget.setYRange(0, fs / 1e6, padding=0)
 
         self.timer = QTimer()
         self.timer.timeout.connect(self.update_display)
@@ -196,10 +184,10 @@ class MainWindow(QMainWindow):
 
         self.worker = Worker(
             input_dir=self.input_dir,
-            cache_dir=CACHE_DIR,
-            fft_size=FFT_SIZE,
-            dataset_name=DATASET_NAME,
-            window_seconds=WINDOW_MINUTES * 60,
+            cache_dir=cache_dir,
+            fft_size=fft_size,
+            dataset_name=dataset_name,
+            window_seconds=window_seconds,
             clear_input=CLEAR_INPUT_FOLDER,
         )
         self.worker.data_ready.connect(self.on_data_ready)
@@ -221,17 +209,12 @@ class MainWindow(QMainWindow):
 
         if spec_matrix.size == 0:
             return
-
-        if DOWNSAMPLE_DISPLAY > 1:
-            spec_matrix = spec_matrix[::DOWNSAMPLE_DISPLAY, :]
-            times = times[::DOWNSAMPLE_DISPLAY]
+        if self.downsample > 1:
+            spec_matrix = spec_matrix[:: self.downsample, :]
+            times = times[:: self.downsample]
 
         spec_db = 10 * np.log10(spec_matrix + 1e-12)
-
-        y_min = 0
-        y_max = FS / 1e6
-
-        # time axis relative to the most recent sample
+        y_min, y_max = 0, self.fs / 1e6
         latest_time = times[-1]
         times_rel = [t - latest_time for t in times]
         x_min, x_max = times_rel[0], 0.0
@@ -245,25 +228,21 @@ class MainWindow(QMainWindow):
         self.img_item.setImage(spec_db, autoLevels=False)
         self.img_item.setLevels([vmin, vmax])
         self.img_item.setRect(QRectF(x_min, y_min, x_max - x_min, y_max - y_min))
-
-        self.plot_widget.setXRange(-WINDOW_MINUTES * 60, 0, padding=0)
+        self.plot_widget.setXRange(-self.window_seconds, 0, padding=0)
         self.plot_widget.setYRange(y_min, y_max, padding=0)
 
         if SAVE_PNG:
-            self.save_png()
+            exporter = pg.exporters.ImageExporter(self.plot_widget.scene())
+            exporter.export(str(OUTPUT_FILE))
 
         now_log = time.time()
         if now_log - self.last_log_time >= 5.0:
             self.last_log_time = now_log
             print(
                 f"[GUI] window: {len(times)} files, "
-                f"rel time {x_min:.1f}–{x_max:.1f} s, "
-                f"power {vmin:.1f}–{vmax:.1f} dB"
+                f"rel time {x_min:.1f}-{x_max:.1f} s, "
+                f"power {vmin:.1f}-{vmax:.1f} dB"
             )
-
-    def save_png(self):
-        exporter = pg.exporters.ImageExporter(self.plot_widget.scene())
-        exporter.export(str(OUTPUT_FILE))
 
     def closeEvent(self, event):
         self.worker.stop()
@@ -272,9 +251,34 @@ class MainWindow(QMainWindow):
 
 
 def main():
+    parser = argparse.ArgumentParser(description="Live rolling spectrogram")
+    parser.add_argument("--input", type=Path, default=INPUT_ROOT)
+    parser.add_argument("--cache", type=Path, default=CACHE_DIR)
+    parser.add_argument("--fft-size", type=int, default=FFT_SIZE)
+    parser.add_argument("--fs", type=float, default=FS)
+    parser.add_argument(
+        "--window", type=float, default=WINDOW_MINUTES, help="Window length in minutes"
+    )
+    parser.add_argument("--dataset", default=DATASET_NAME)
+    parser.add_argument(
+        "--downsample",
+        type=int,
+        default=DOWNSAMPLE_DISPLAY,
+        help="Keep every N-th file in display",
+    )
+    args = parser.parse_args()
+
     pg.setConfigOptions(useOpenGL=False, antialias=True)
     app = QApplication(sys.argv)
-    window = MainWindow()
+    window = MainWindow(
+        input_dir=args.input,
+        cache_dir=args.cache,
+        fft_size=args.fft_size,
+        dataset_name=args.dataset,
+        window_seconds=args.window * 60,
+        fs=args.fs,
+        downsample=args.downsample,
+    )
     window.show()
     sys.exit(app.exec_())
 

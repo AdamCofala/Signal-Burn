@@ -16,7 +16,6 @@ venv/
 .python-version
 
 # --- Data  ---
-*.bin
 dane/
 hf25/
 thor.py
