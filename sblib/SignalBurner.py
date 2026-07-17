@@ -12,7 +12,7 @@ class SignalBurner:
     Provides:
       - process_file(h5_path)           -> single power spectrum (float32 array)
       - process_cross(h5_path1, h5_path2) -> cross-spectrum magnitude (float32 array)
-      - process_fft_files(folder)       -> batch power spectra for all .h5 files in folder
+      - process_fft_files(folder)         -> batch power spectra for all .h5 files in folder
       - process_cross_files(folder1, folder2) -> batch cross-spectra for paired files
     """
 
@@ -75,6 +75,16 @@ class SignalBurner:
             ]
             lib.sb_process_cross_fft.restype = ctypes.c_int
 
+            # sb_process_coherence
+            lib.sb_process_coherence.argtypes = [
+                ctypes.POINTER(ctypes.c_int16),
+                ctypes.POINTER(ctypes.c_int16),
+                ctypes.c_size_t,
+                ctypes.POINTER(ctypes.c_float),
+                ctypes.c_int,
+            ]
+            lib.sb_process_coherence.restype = ctypes.c_int
+
             if hasattr(lib, "sb_shutdown"):
                 lib.sb_shutdown.argtypes = []
                 lib.sb_shutdown.restype = None
@@ -132,6 +142,22 @@ class SignalBurner:
         )
         if ret != 0:
             raise RuntimeError(f"sb_process_cross_fft failed (code {ret})")
+        return out
+
+    def run_gpu_coherence(
+        self, data1: np.ndarray, data2: np.ndarray, num_samples: int
+    ) -> np.ndarray:
+        lib = self.load_library()
+        out = np.empty(self.fft_size, dtype=np.float32)
+        ret = lib.sb_process_coherence(
+            data1.ctypes.data_as(ctypes.POINTER(ctypes.c_int16)),
+            data2.ctypes.data_as(ctypes.POINTER(ctypes.c_int16)),
+            ctypes.c_size_t(num_samples),
+            out.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+            ctypes.c_int(self.fft_size),
+        )
+        if ret != 0:
+            raise RuntimeError(f"sb_process_coherence failed (code {ret})")
         return out
 
     # Cache helpers
@@ -203,6 +229,15 @@ class SignalBurner:
             np.save(cache_file, out)
 
         return out
+
+    def process_coherence(self, h5_path1: Path, h5_path2: Path) -> np.ndarray:
+        data1, nsamp1 = self.load_iq_data(h5_path1)
+        data2, nsamp2 = self.load_iq_data(h5_path2)
+
+        if nsamp1 != nsamp2:
+            raise ValueError(f"Sample count mismatch: {nsamp1} vs {nsamp2}")
+
+        return self.run_gpu_coherence(data1, data2, nsamp1)
 
     # Batch processing – folder level
     def process_fft_files(self, folder: Path) -> list[tuple[Path, np.ndarray]]:

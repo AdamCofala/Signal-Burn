@@ -20,9 +20,6 @@ __global__ void convert(const IQSample* in, cufftComplex* out, int n) {
     }
 }
 
-// Hann window, applied in-place to a complex buffer right after convert(),
-// before the FFT. Same window used for both channels in the cross path so
-// neither signal's phase/magnitude is biased relative to the other.
 __global__ void applyWindowHann(cufftComplex* data, int n) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx < n) {
@@ -85,7 +82,6 @@ __global__ void crossAccumulate(const cufftComplex* fft1, const cufftComplex* ff
 {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) {
-        // accum += fft1 * conj(fft2)
         float real = fft1[i].x * fft2[i].x + fft1[i].y * fft2[i].y;
         float imag = fft1[i].y * fft2[i].x - fft1[i].x * fft2[i].y;
         accum[i].x += real;
@@ -101,13 +97,13 @@ __global__ void normalizeComplex(cufftComplex* accum, int num_windows, int n) {
     }
 }
 
-__global__ void shiftFFTComplex(const cufftComplex* in, float* out, int n) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx < n) {
-        int shift = n / 2;
-        int src_idx = (idx + shift) % n;
-        out[2*idx]   = in[src_idx].x;
-        out[2*idx+1] = in[src_idx].y;
+// Coherence calculation kernel: Cxy = |Pxy|^2 / (Pxx * Pyy)
+__global__ void calculateCoherence(const cufftComplex* cross_acc, const float* pow1, const float* pow2, float* out, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) {
+        float cross_mag_sq = cross_acc[i].x * cross_acc[i].x + cross_acc[i].y * cross_acc[i].y;
+        float den = pow1[i] * pow2[i];
+        out[i] = (den > 1e-12f) ? (cross_mag_sq / den) : 0.0f;
     }
 }
 
@@ -116,7 +112,6 @@ __global__ void shiftFFTComplex(const cufftComplex* in, float* out, int n) {
 static std::unordered_map<int, cufftHandle> g_plans;
 static std::mutex g_state_mutex;
 
-// Buffers for power spectrum
 static IQSample* g_d_in = nullptr;
 static cufftComplex* g_d_fft = nullptr;
 static float* g_d_pow = nullptr;
@@ -125,13 +120,16 @@ static float* g_d_result = nullptr;
 static int g_allocated_n = 0;
 static size_t g_allocated_in_size = 0;
 
-// Buffers for cross spectrum
 static IQSample*       g_d_in2          = nullptr;
 static cufftComplex*   g_d_fft_saved    = nullptr;
 static cufftComplex*   g_d_cross_accum  = nullptr;
 static float*          g_d_cross_result = nullptr;
 static int             g_allocated_n_cross = 0;
 static size_t          g_allocated_in2_size = 0;
+
+// Buffers for coherence (power spectra)
+static float* g_d_pow1 = nullptr;
+static float* g_d_pow2 = nullptr;
 
 static cufftHandle get_plan(int n) {
     auto it = g_plans.find(n);
@@ -166,6 +164,13 @@ void reallocate_cross_corelation_buffers(int fft_size) {
     g_allocated_n_cross = fft_size;
 }
 
+void reallocate_coherence_buffers(int fft_size) {
+    if (g_d_pow1) cudaFree(g_d_pow1);
+    if (g_d_pow2) cudaFree(g_d_pow2);
+    cudaMalloc(&g_d_pow1, fft_size * sizeof(float));
+    cudaMalloc(&g_d_pow2, fft_size * sizeof(float));
+}
+
 void reallocate_input(size_t num_samples) {
     if (g_d_in) cudaFree(g_d_in);
     cudaMalloc(&g_d_in, num_samples * sizeof(IQSample));
@@ -182,11 +187,9 @@ void reallocate_input2(size_t num_samples) {
 
 int sb_process_fft(const int16_t* interleaved_iq, size_t num_samples, float* out_spectrum, int fft_size) {
     if (num_samples < (size_t)fft_size) return -1;
-
     std::lock_guard<std::mutex> lock(g_state_mutex);
 
     if (fft_size > g_allocated_n) reallocate_FFT_buffers(fft_size);
-
     if (num_samples > g_allocated_in_size) reallocate_input(num_samples);
 
     cudaMemcpy(g_d_in, interleaved_iq, num_samples * sizeof(IQSample), cudaMemcpyHostToDevice);
@@ -194,7 +197,6 @@ int sb_process_fft(const int16_t* interleaved_iq, size_t num_samples, float* out
 
     int num_windows = 0;
     int stride = fft_size / 2;
-
     cufftHandle plan = get_plan(fft_size);
     if (plan == 0) return -2;
 
@@ -209,28 +211,19 @@ int sb_process_fft(const int16_t* interleaved_iq, size_t num_samples, float* out
 
     if (num_windows > 0) {
         normalize<<< (fft_size + 255)/256, 256 >>>(g_d_accum, num_windows, fft_size);
-        // Separate gain-correction step (not folded into normalize).
-        // For power (fftPower/accum), gain_factor = 1/(coherent_gain^2) = 1/0.25 = 4.0f
         correctGain<<< (fft_size + 255)/256, 256 >>>(g_d_accum, 4.0f, fft_size);
         shiftFFT<<< (fft_size + 255)/256, 256 >>>(g_d_accum, g_d_result, fft_size);
         cudaMemcpy(out_spectrum, g_d_result, fft_size * sizeof(float), cudaMemcpyDeviceToHost);
     }
-
     return 0;
 }
 
-int sb_process_cross_fft(const int16_t* in1, const int16_t* in2,
-    size_t num_samples,
-    float* out_cross,
-    int fft_size)
-{
+int sb_process_cross_fft(const int16_t* in1, const int16_t* in2, size_t num_samples, float* out_cross, int fft_size) {
     if (num_samples < (size_t) fft_size) return -1;
-
     std::lock_guard<std::mutex> lock(g_state_mutex);
 
     if (fft_size > g_allocated_n_cross) reallocate_cross_corelation_buffers(fft_size);
     if (fft_size > g_allocated_n)       reallocate_FFT_buffers(fft_size);
-
     if (num_samples > g_allocated_in_size)  reallocate_input(num_samples);
     if (num_samples > g_allocated_in2_size) reallocate_input2(num_samples);
 
@@ -240,7 +233,6 @@ int sb_process_cross_fft(const int16_t* in1, const int16_t* in2,
 
     int num_windows = 0;
     int stride = fft_size / 2;
-
     cufftHandle plan = get_plan(fft_size);
     if (plan == 0) return -2;
 
@@ -250,27 +242,76 @@ int sb_process_cross_fft(const int16_t* in1, const int16_t* in2,
         cufftExecC2C(plan, g_d_fft, g_d_fft, CUFFT_FORWARD);
         cudaMemcpy(g_d_fft_saved, g_d_fft, fft_size * sizeof(cufftComplex), cudaMemcpyDeviceToDevice);
 
-        // Process second signal segment (overwrites g_d_fft)
         convert<<< (fft_size + 255)/256, 256 >>>(g_d_in2 + offset, g_d_fft, fft_size);
         applyWindowHann<<< (fft_size + 255)/256, 256 >>>(g_d_fft, fft_size);
         cufftExecC2C(plan, g_d_fft, g_d_fft, CUFFT_FORWARD);
 
-        // Accumulate cross product
         crossAccumulate<<< (fft_size + 255)/256, 256 >>>(g_d_fft_saved, g_d_fft, g_d_cross_accum, fft_size);
-
         num_windows++;
     }
 
     if (num_windows > 0) {
         normalizeComplex<<< (fft_size + 255)/256, 256 >>>(g_d_cross_accum, num_windows, fft_size);
         magnitude<<< (fft_size + 255)/256, 256 >>>(g_d_cross_accum, g_d_accum, fft_size);
-        // Separate gain-correction step (not folded into normalizeComplex).
-        // For magnitude, gain_factor = 1/coherent_gain = 1/0.5 = 2.0f
         correctGain<<< (fft_size + 255)/256, 256 >>>(g_d_accum, 2.0f, fft_size);
         shiftFFT<<< (fft_size + 255)/256, 256 >>>(g_d_accum, g_d_result, fft_size);
         cudaMemcpy(out_cross, g_d_result, fft_size * sizeof(float), cudaMemcpyDeviceToHost);
     }
+    return 0;
+}
 
+int sb_process_coherence(const int16_t* in1, const int16_t* in2, size_t num_samples, float* out_coherence, int fft_size) {
+    if (num_samples < (size_t)fft_size) return -1;
+    std::lock_guard<std::mutex> lock(g_state_mutex);
+
+    if (fft_size > g_allocated_n_cross) reallocate_cross_corelation_buffers(fft_size);
+    if (fft_size > g_allocated_n)       reallocate_FFT_buffers(fft_size);
+    reallocate_coherence_buffers(fft_size);
+    if (num_samples > g_allocated_in_size)  reallocate_input(num_samples);
+    if (num_samples > g_allocated_in2_size) reallocate_input2(num_samples);
+
+    cudaMemcpy(g_d_in,  in1, num_samples * sizeof(IQSample), cudaMemcpyHostToDevice);
+    cudaMemcpy(g_d_in2, in2, num_samples * sizeof(IQSample), cudaMemcpyHostToDevice);
+
+    cudaMemset(g_d_cross_accum, 0, fft_size * sizeof(cufftComplex));
+    cudaMemset(g_d_pow1, 0, fft_size * sizeof(float));
+    cudaMemset(g_d_pow2, 0, fft_size * sizeof(float));
+
+    int num_windows = 0;
+    int stride = fft_size / 2;
+    cufftHandle plan = get_plan(fft_size);
+    if (plan == 0) return -2;
+
+    for (size_t offset = 0; offset + fft_size <= num_samples; offset += stride) {
+        // Process Channel 1
+        convert<<< (fft_size + 255)/256, 256 >>>(g_d_in + offset, g_d_fft, fft_size);
+        applyWindowHann<<< (fft_size + 255)/256, 256 >>>(g_d_fft, fft_size);
+        cufftExecC2C(plan, g_d_fft, g_d_fft, CUFFT_FORWARD);
+        cudaMemcpy(g_d_fft_saved, g_d_fft, fft_size * sizeof(cufftComplex), cudaMemcpyDeviceToDevice);
+        fftPower<<< (fft_size + 255)/256, 256 >>>(g_d_fft, g_d_pow, fft_size);
+        accumulate<<< (fft_size + 255)/256, 256 >>>(g_d_pow, g_d_pow1, fft_size);
+
+        // Process Channel 2
+        convert<<< (fft_size + 255)/256, 256 >>>(g_d_in2 + offset, g_d_fft, fft_size);
+        applyWindowHann<<< (fft_size + 255)/256, 256 >>>(g_d_fft, fft_size);
+        cufftExecC2C(plan, g_d_fft, g_d_fft, CUFFT_FORWARD);
+        fftPower<<< (fft_size + 255)/256, 256 >>>(g_d_fft, g_d_pow, fft_size);
+        accumulate<<< (fft_size + 255)/256, 256 >>>(g_d_pow, g_d_pow2, fft_size);
+
+        // Cross
+        crossAccumulate<<< (fft_size + 255)/256, 256 >>>(g_d_fft_saved, g_d_fft, g_d_cross_accum, fft_size);
+        num_windows++;
+    }
+
+    if (num_windows > 0) {
+        normalize<<< (fft_size + 255)/256, 256 >>>(g_d_pow1, num_windows, fft_size);
+        normalize<<< (fft_size + 255)/256, 256 >>>(g_d_pow2, num_windows, fft_size);
+        normalizeComplex<<< (fft_size + 255)/256, 256 >>>(g_d_cross_accum, num_windows, fft_size);
+
+        calculateCoherence<<< (fft_size + 255)/256, 256 >>>(g_d_cross_accum, g_d_pow1, g_d_pow2, g_d_accum, fft_size);
+        shiftFFT<<< (fft_size + 255)/256, 256 >>>(g_d_accum, g_d_result, fft_size);
+        cudaMemcpy(out_coherence, g_d_result, fft_size * sizeof(float), cudaMemcpyDeviceToHost);
+    }
     return 0;
 }
 
@@ -282,18 +323,19 @@ void sb_shutdown() {
     }
     g_plans.clear();
 
-    // Free power-spectrum buffers
     if (g_d_in)      { cudaFree(g_d_in);      g_d_in = nullptr; }
     if (g_d_fft)     { cudaFree(g_d_fft);     g_d_fft = nullptr; }
     if (g_d_pow)     { cudaFree(g_d_pow);     g_d_pow = nullptr; }
     if (g_d_accum)   { cudaFree(g_d_accum);   g_d_accum = nullptr; }
     if (g_d_result)  { cudaFree(g_d_result);  g_d_result = nullptr; }
 
-    // Free cross-spectrum buffers
-    if (g_d_in2)           { cudaFree(g_d_in2);           g_d_in2 = nullptr; }
-    if (g_d_fft_saved)     { cudaFree(g_d_fft_saved);     g_d_fft_saved = nullptr; }
-    if (g_d_cross_accum)   { cudaFree(g_d_cross_accum);   g_d_cross_accum = nullptr; }
-    if (g_d_cross_result)  { cudaFree(g_d_cross_result);  g_d_cross_result = nullptr; }
+    if (g_d_in2)         { cudaFree(g_d_in2);         g_d_in2 = nullptr; }
+    if (g_d_fft_saved)   { cudaFree(g_d_fft_saved);   g_d_fft_saved = nullptr; }
+    if (g_d_cross_accum) { cudaFree(g_d_cross_accum); g_d_cross_accum = nullptr; }
+    if (g_d_cross_result){ cudaFree(g_d_cross_result); g_d_cross_result = nullptr; }
+
+    if (g_d_pow1) { cudaFree(g_d_pow1); g_d_pow1 = nullptr; }
+    if (g_d_pow2) { cudaFree(g_d_pow2); g_d_pow2 = nullptr; }
 
     g_allocated_n = 0;
     g_allocated_in_size = 0;

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Cross‑spectrogram with nearest‑timestamp pairing, diagnostics, and per-file timers."""
+"""Coherence spectrogram with nearest-timestamp pairing, diagnostics, and per-file timers."""
 
 # Wyłączamy blokowanie plików HDF5 na samym początku
 import os
@@ -24,7 +24,7 @@ CACHE_DIR = Path("/pool/signal_storage/cache")
 DATASET_NAME = "rf_data"
 FFT_SIZE = 262144
 FS = 25_000_000  # Hz
-OUT_PNG = "cross_spectrogram.png"
+OUT_PNG = "coherence_spectrogram.png"
 MAX_RETRIES = 3
 RETRY_DELAY = 0.2
 MAX_TIME_DIFF = 0.0  # seconds – max allowed mismatch for pairing
@@ -177,18 +177,19 @@ def main() -> None:
 
             # Mierzymy czas procesowania konkretnego pliku
             t_pair_start = time.perf_counter()
-            mag = burner.process_cross(p1, p2)
+            # Używamy process_coherence zamiast process_cross
+            coherence = burner.process_coherence(p1, p2)
             t_pair_elapsed = time.perf_counter() - t_pair_start
 
             # Inicjalizacja pliku na dysku podczas pierwszej udanej iteracji
             if spec_matrix_mmapped is None:
-                shape = (len(mag), len(valid_pairs))
+                shape = (len(coherence), len(valid_pairs))
                 spec_matrix_mmapped = np.memmap(
-                    mmap_path, dtype=mag.dtype, mode="w+", shape=shape
+                    mmap_path, dtype=coherence.dtype, mode="w+", shape=shape
                 )
 
             # Zapisz wynik bezpośrednio na dysk
-            spec_matrix_mmapped[:, kept] = mag
+            spec_matrix_mmapped[:, kept] = coherence
             timestamps.append((ts1 + ts2) / 2)  # mean timestamp
             kept += 1
 
@@ -196,7 +197,7 @@ def main() -> None:
             print(f"OK ({t_pair_elapsed:.3f} s)")
 
             # Ręczne czyszczenie pamięci po każdej iteracji
-            del mag
+            del coherence
             gc.collect()
 
         except Exception as exc:
@@ -216,8 +217,8 @@ def main() -> None:
     spec_matrix = spec_matrix_mmapped[:, :kept][:, ::-1]
     timestamps = timestamps[:kept][::-1]
 
-    # Przeliczamy na dB
-    spec_db = 10 * np.log10(spec_matrix + 1e-12)
+    # Coherence jest w zakresie [0, 1], nie logarytmujemy
+    spec_data = spec_matrix
 
     # Time axis: assume ~1 s per file, show seconds from first timestamp
     timestamps = np.array(timestamps)
@@ -229,18 +230,20 @@ def main() -> None:
 
     plt.figure(figsize=(16, 9))
     plt.imshow(
-        spec_db,
+        spec_data,
         aspect="auto",
         origin="lower",
         extent=[0, t_end, freq_axis[0], freq_axis[-1]],
         cmap="jet",
-        vmin=np.percentile(spec_db, 5),
-        vmax=np.percentile(spec_db, 95),
+        vmin=0.0,
+        vmax=1.0,  # Coherence jest w zakresie [0, 1]
     )
     plt.xlabel("Time [s]")
     plt.ylabel("Frequency [MHz]")
-    plt.colorbar(label="Cross‑spectrum magnitude [dB]")
-    plt.title(f"Cross‑spectrogram – {cha1_dir.name} / {cha2_dir.name}  ({kept} pairs)")
+    plt.colorbar(label="Magnitude Squared Coherence")
+    plt.title(
+        f"Coherence Spectrogram – {cha1_dir.name} / {cha2_dir.name}  ({kept} pairs)"
+    )
     plt.tight_layout()
 
     plt.savefig(OUT_PNG, dpi=300)
