@@ -7,31 +7,44 @@ import numpy as np
 from pathlib import Path
 from sblib.SignalBurner import SignalBurner
 
-INPUT_DIR = Path("/pool/signal_storage/hf25/cha1/2026-07-14T18-00-00")
+INPUT_ROOT = Path("/dev/shm/signal-burn/hf25/cha1")
 
 FFT_SIZE = 262144
 FS = 25_000_000
 OUT_PNG = "spectrogram_final.png"
 
 
+def latest_input_dir(base_dir: Path) -> Path:
+    if not base_dir.exists():
+        return base_dir
+    subdirs = [path for path in base_dir.iterdir() if path.is_dir()]
+    if not subdirs:
+        return base_dir
+    return max(subdirs, key=lambda path: (path.stat().st_mtime, path.name))
+
+
 def main():
+    input_dir = latest_input_dir(INPUT_ROOT)
+    print(f"Using input directory: {input_dir}")
+
     print(f"Init SignalBurner (FFT_SIZE={FFT_SIZE})...")
     sb = SignalBurner(
-        input_path=INPUT_DIR,
         cache_path=Path("/pool/signal_storage/cache"),
         dataset_name="rf_data",
         use_cache=True,
         fft_size=FFT_SIZE,
+        show_logs=True,
     )
 
     print("Starting processing (GPU Accelerated)...")
     t_start = time.perf_counter()
 
-    results = sb.run()
+    # Nowe API: przetwarzamy wszystkie pliki w folderze
+    results = sb.process_fft_files(input_dir)
 
     print("Shutting down SignalBurner...")
     sb.shutdown()
-    # sb.clean_cache(10)
+    sb.clean_cache(10)
 
     t_total = time.perf_counter() - t_start
 
@@ -44,6 +57,7 @@ def main():
     )
     print("Building spectogram matrix...")
 
+    # results to lista krotek (Path, widmo)
     columns = [res[1] for res in results]
     spectrogram = np.stack(columns, axis=1)
 
@@ -70,7 +84,7 @@ def main():
     plt.xlabel("Time [Index/Files]")
     plt.ylabel("Frequency [MHz]")
     plt.colorbar(label="Power [dB]")
-    plt.title(f"{INPUT_DIR.name} | {len(results)} files | FFT Window {FFT_SIZE}")
+    plt.title(f"{input_dir.name} | {len(results)} files | FFT Window {FFT_SIZE}")
 
     plt.tight_layout()
     plt.savefig(OUT_PNG, dpi=300)

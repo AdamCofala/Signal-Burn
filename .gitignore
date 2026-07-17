@@ -4,6 +4,7 @@ bin/*
 *.o
 *.d
 *.fatbin
+*.sh
 
 # --- Python ---
 __pycache__/
@@ -17,6 +18,9 @@ venv/
 # --- Data  ---
 *.bin
 dane/
+hf25/
+thor.py
+
 
 # --- IDE & OS ---
 .vscode/
