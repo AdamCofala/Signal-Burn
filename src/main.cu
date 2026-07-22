@@ -337,17 +337,17 @@ void sb_shutdown() {
     for (auto& kv : g_plans) cufftDestroy(kv.second);
     g_plans.clear();
 
-    if (g_d_in)      { cudaFree(g_d_in);      g_d_in = nullptr; }
-    if (g_d_fft)     { cudaFree(g_d_fft);     g_d_fft = nullptr; }
-    if (g_d_pow)     { cudaFree(g_d_pow);     g_d_pow = nullptr; }
-    if (g_d_accum)   { cudaFree(g_d_accum);   g_d_accum = nullptr; }
-    if (g_d_result)  { cudaFree(g_d_result);  g_d_result = nullptr; }
-    if (g_d_in2)         { cudaFree(g_d_in2);         g_d_in2 = nullptr; }
-    if (g_d_fft_saved)   { cudaFree(g_d_fft_saved);   g_d_fft_saved = nullptr; }
-    if (g_d_cross_accum) { cudaFree(g_d_cross_accum); g_d_cross_accum = nullptr; }
+    if (g_d_in)          { cudaFree(g_d_in);           g_d_in = nullptr; }
+    if (g_d_fft)         { cudaFree(g_d_fft);          g_d_fft = nullptr; }
+    if (g_d_pow)         { cudaFree(g_d_pow);          g_d_pow = nullptr; }
+    if (g_d_accum)       { cudaFree(g_d_accum);        g_d_accum = nullptr; }
+    if (g_d_result)      { cudaFree(g_d_result);       g_d_result = nullptr; }
+    if (g_d_in2)         { cudaFree(g_d_in2);          g_d_in2 = nullptr; }
+    if (g_d_fft_saved)   { cudaFree(g_d_fft_saved);    g_d_fft_saved = nullptr; }
+    if (g_d_cross_accum) { cudaFree(g_d_cross_accum);  g_d_cross_accum = nullptr; }
     if (g_d_cross_result){ cudaFree(g_d_cross_result); g_d_cross_result = nullptr; }
-    if (g_d_pow1) { cudaFree(g_d_pow1); g_d_pow1 = nullptr; }
-    if (g_d_pow2) { cudaFree(g_d_pow2); g_d_pow2 = nullptr; }
+    if (g_d_pow1)        { cudaFree(g_d_pow1);         g_d_pow1 = nullptr; }
+    if (g_d_pow2)        { cudaFree(g_d_pow2);         g_d_pow2 = nullptr; }
 
     g_allocated_n = 0;
     g_allocated_in_size = 0;

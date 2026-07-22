@@ -1,19 +1,19 @@
 #!/usr/bin/env python3
-"""Live dual‑channel spectrograms + coherence (PyQt5 + pyqtgraph).
+"""Live dual-channel spectrograms + coherence (PyQt5 + pyqtgraph).
 
-Displays three rolling spectrograms side‑by‑side:
+Displays three rolling spectrograms side-by-side:
   - Channel 1 power [dB]
   - Channel 2 power [dB]
-  - Magnitude squared coherence [0‑1]
+  - Magnitude squared coherence [0-1]
 Files from two folders are paired by nearest timestamp and processed on the GPU.
-Updates immediately when a new pair is processed – no artificial timer delay.
+Updates immediately when a new pair is processed - no artificial timer delay.
 """
 
 import argparse
 import sys
 import time
 import re
-import threading
+
 from pathlib import Path
 from collections import deque
 import bisect
@@ -43,7 +43,7 @@ X_FUTURE = 5.0  # seconds to extend x-axis into the future
 
 
 def latest_input_dir(base: Path) -> Path:
-    """Return the most recent timestamp‑named subdirectory."""
+    """Return the most recent timestamp-named subdirectory."""
     if not base.exists():
         return base
     subdirs = [p for p in base.iterdir() if p.is_dir()]
@@ -62,7 +62,7 @@ def parse_timestamp(filename: Path) -> float:
 
 class Worker(QThread):
     """Background thread – scans two folders incrementally, pairs files,
-    computes FFTs + coherence, and emits dB‑converted spectra."""
+    computes FFTs + coherence, and emits dB-converted spectra."""
 
     data_ready = pyqtSignal(object)  # (times, spec1_dB, spec2_dB, coh_spec)
 
@@ -423,7 +423,7 @@ class MainWindow(QMainWindow):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Live dual‑channel spectrograms + coherence"
+        description="Live dual-channel spectrograms + coherence"
     )
     parser.add_argument("--cha1", type=Path, default=CHA1_ROOT)
     parser.add_argument("--cha2", type=Path, default=CHA2_ROOT)

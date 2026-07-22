@@ -16,7 +16,7 @@ CACHE_DIR = Path("/pool/signal_storage/cache")
 DATASET_NAME = "rf_data"
 FFT_SIZE = 262144
 FS = 25_000_000
-OUT_PNG = "spectrogram_final.png"
+OUT_PNG = "images/spectrogram_final.png"
 # ------------------------------
 
 

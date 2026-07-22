@@ -1,4 +1,4 @@
-"""GPU‑accelerated I/Q HDF5 processing library (SignalBurner)."""
+"""GPU-accelerated I/Q HDF5 processing library (SignalBurner)."""
 
 import ctypes
 from pathlib import Path
@@ -10,7 +10,7 @@ from typing import Optional, List, Tuple
 
 
 class SignalBurner:
-    """Process I/Q HDF5 files with CUDA‑accelerated FFT, cross‑spectrum,
+    """Process I/Q HDF5 files with CUDA-accelerated FFT, cross-spectrum,
     and coherence computations.
 
     Parameters
@@ -26,18 +26,12 @@ class SignalBurner:
         Whether to cache results on disk.
     cache_path : Path or None
         Directory for cached ``.npy`` files.
-    save_files : bool
-        (Unused reserved flag).
-    output_path : Path or None
-        (Unused reserved flag).
     show_logs : bool
         Print progress messages.
     """
 
     def __init__(
         self,
-        save_files: bool = False,
-        output_path: Optional[Path] = None,
         cache_path: Optional[Path] = None,
         dataset_name: Optional[str] = None,
         lib_path: Optional[Path] = None,
@@ -45,14 +39,13 @@ class SignalBurner:
         use_cache: bool = True,
         show_logs: bool = False,
     ) -> None:
-        self.output_path = output_path
+
         self.cache_path = (
             Path(cache_path)
             if cache_path is not None
             else Path(__file__).parent.parent / "cache"
         )
         self.dataset_name = dataset_name
-        self.save_files = save_files
         self.fft_size = fft_size
         self.use_cache = use_cache
         self.show_logs = show_logs
@@ -63,6 +56,7 @@ class SignalBurner:
             else Path(__file__).parent.parent / "bin" / "libsb_core.so"
         )
         self._lib = None
+        self.load_library()
 
     # -- GPU library loading
     def load_library(self) -> ctypes.CDLL:
@@ -135,8 +129,8 @@ class SignalBurner:
 
     # -- GPU runners
     def _run_single(self, data: np.ndarray, num_samples: int) -> np.ndarray:
-        """Run single‑channel FFT on GPU."""
-        self.load_library()
+        """Run single-channel FFT on GPU."""
+
         out = np.empty(self.fft_size, dtype=np.float32)
         ret = self._lib.sb_process_fft(
             data.ctypes.data_as(ctypes.POINTER(ctypes.c_int16)),
@@ -152,7 +146,7 @@ class SignalBurner:
         self, data1: np.ndarray, data2: np.ndarray, num_samples: int, lib_func
     ) -> np.ndarray:
         """Run a two-channel GPU operation (cross or coherence)."""
-        self.load_library()
+
         out = np.empty(self.fft_size, dtype=np.float32)
         ret = lib_func(
             data1.ctypes.data_as(ctypes.POINTER(ctypes.c_int16)),
@@ -167,7 +161,7 @@ class SignalBurner:
 
     # -- Cache helpers -------
     def get_cache_file(self, h5_path: Path) -> Optional[Path]:
-        """Return cache path for a single‑file FFT."""
+        """Return cache path for a single-file FFT."""
         if self.cache_path is None:
             return None
         self.cache_path.mkdir(parents=True, exist_ok=True)
@@ -208,7 +202,7 @@ class SignalBurner:
         return out
 
     def process_cross(self, h5_path1: Path, h5_path2: Path) -> np.ndarray:
-        """Cross‑spectrum magnitude between two HDF5 files."""
+        """Cross-spectrum magnitude between two HDF5 files."""
         cache_file = self._pair_cache_file(h5_path1, h5_path2, "cross")
         if cache_file and cache_file.exists():
             mtime1 = os.path.getmtime(h5_path1)
@@ -216,7 +210,7 @@ class SignalBurner:
             if cache_file.stat().st_mtime >= max(mtime1, mtime2):
                 if self.show_logs:
                     print(
-                        f"Loading cached cross‑spectrum for {h5_path1.name} & {h5_path2.name}..."
+                        f"Loading cached cross-spectrum for {h5_path1.name} & {h5_path2.name}..."
                     )
                 return np.load(cache_file)
 
@@ -235,7 +229,7 @@ class SignalBurner:
         return out
 
     def process_coherence(self, h5_path1: Path, h5_path2: Path) -> np.ndarray:
-        """Magnitude‑squared coherence between two HDF5 files."""
+        """Magnitude-squared coherence between two HDF5 files."""
         cache_file = self._pair_cache_file(h5_path1, h5_path2, "coherence")
         if cache_file and cache_file.exists():
             mtime1 = os.path.getmtime(h5_path1)
@@ -283,7 +277,7 @@ class SignalBurner:
     def process_cross_files(
         self, folder1: Path, folder2: Path
     ) -> List[Tuple[Path, Path, np.ndarray]]:
-        """Compute cross‑spectra for paired files in two folders.
+        """Compute cross-spectra for paired files in two folders.
         Files are paired by sorted name."""
         folder1 = Path(folder1)
         folder2 = Path(folder2)
@@ -310,12 +304,66 @@ class SignalBurner:
                 print(f"Error processing pair ({fp1.name}, {fp2.name}): {e}")
         return results
 
+    def save_to_h5(
+        self,
+        h5_path: Path,
+        datasets: dict,
+        metadata: Optional[dict] = None,
+        mode: str = "a",
+    ) -> Path:
+        """Universal save — works for FFT spectra, cross-spectra, coherence,
+        or any other array result.
+
+        Parameters
+        ----------
+        h5_path : Path
+            Target .h5 file.
+        datasets : dict
+            Maps a path -> array, e.g.:
+                {
+                    "fft/file1": spectrum,
+                    "cross/file1_file2": cross_spec,
+                    "coherence/file1_file2": coh,
+                }
+            "/" in the key auto-creates nested groups (h5py handles this).
+            A value can also be (array, attrs_dict) to attach per-dataset
+            metadata, e.g. {"fft/file1": (spectrum, {"fft_size": 8192})}.
+        metadata : dict, optional
+            File-level attrs (sample_rate, fft_size, timestamp, source files...).
+        mode : str
+            "a" (default) = append/create, "w" = overwrite whole file.
+        """
+        h5_path = Path(h5_path)
+        h5_path.parent.mkdir(parents=True, exist_ok=True)
+
+        with h5py.File(h5_path, mode) as f:
+            for key, value in datasets.items():
+                if isinstance(value, tuple):
+                    arr, ds_attrs = value
+                else:
+                    arr, ds_attrs = value, None
+
+                arr = np.asarray(arr)
+                if key in f:
+                    del f[key]  # overwrite if it already exists
+                ds = f.create_dataset(key, data=arr)
+
+                if ds_attrs:
+                    for k, v in ds_attrs.items():
+                        ds.attrs[k] = v
+
+            if metadata:
+                f.attrs["saved_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
+                for k, v in metadata.items():
+                    f.attrs[k] = v
+
+        return h5_path
+
     # -- Cleanup ----
     def shutdown(self) -> None:
         """Release GPU resources."""
-        lib = self.load_library()
-        if hasattr(lib, "sb_shutdown"):
-            lib.sb_shutdown()
+        if hasattr(self._lib, "sb_shutdown"):
+            self._lib.sb_shutdown()
 
     def clean_cache(self, max_age_minutes: int = 30) -> int:
         """Remove cached ``.npy`` files older than *max_age_minutes*."""
