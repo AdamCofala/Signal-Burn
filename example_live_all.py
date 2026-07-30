@@ -27,8 +27,8 @@ from PyQt5.QtWidgets import QApplication, QMainWindow, QVBoxLayout, QWidget
 from sblib.SignalBurner import SignalBurner
 
 # ----------------------------- defaults ---------------------------------
-CHA1_ROOT = Path("/dev/shm/hf25/cha2/data")
-CHA2_ROOT = Path("/dev/shm/hf25/cha3/data")
+CHA1_ROOT = Path("/dev/shm/hf25/cha1/data")
+CHA2_ROOT = Path("/dev/shm/hf25/cha2/data")
 CACHE_DIR = Path("/pool/signal_storage/cache")
 FFT_SIZE = 262144
 FS = 25_000_000  # Hz
