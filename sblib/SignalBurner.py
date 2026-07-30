@@ -109,13 +109,20 @@ class SignalBurner:
         Returns (data, num_samples).
         """
         with h5py.File(h5_path, "r") as f:
-            raw = f[self.dataset_name][:]
+            ds = f[self.dataset_name]
+            raw = np.empty(ds.shape, dtype=ds.dtype)
+            ds.read_direct(raw)
 
         if raw.dtype.fields and {"r", "i"}.issubset(raw.dtype.fields):
-            num_samples = raw.shape[0]
-            data = np.empty(num_samples * 2, dtype=np.int16)
-            data[0::2] = raw["r"].ravel()
-            data[1::2] = raw["i"].ravel()
+            if raw.dtype.itemsize == 4 and raw.flags["C_CONTIGUOUS"]:
+                # compound {r:int16, i:int16}, no padding -> already interleaved
+                # in memory as r0,i0,r1,i1,... — zero-copy view, no strided copy
+                data = raw.view(np.int16).ravel()
+            else:
+                num_samples = raw.shape[0]
+                data = np.empty(num_samples * 2, dtype=np.int16)
+                data[0::2] = raw["r"].ravel()
+                data[1::2] = raw["i"].ravel()
         else:
             data = np.asarray(raw, dtype=np.int16).ravel()
             if data.size % 2 != 0:

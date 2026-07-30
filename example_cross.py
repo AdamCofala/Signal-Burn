@@ -139,7 +139,7 @@ def main():
         use_cache=True,
         show_logs=False,
     )
-    burner.clean_cache(0)
+    burner.clean_cache(5)
 
     temp_dir = tempfile.mkdtemp()
     mmap_path = Path(temp_dir) / "spec_matrix.dat"
@@ -197,7 +197,7 @@ def main():
         aspect="auto",
         origin="lower",
         extent=[0, t_end, freq_axis[0], freq_axis[-1]],
-        cmap="jet",
+        cmap="plasma",
         vmin=np.percentile(spec_db, 5),
         vmax=np.percentile(spec_db, 95),
     )

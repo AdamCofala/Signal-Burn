@@ -26,3 +26,6 @@ thor.py
 .idea/
 .DS_Store
 Thumbs.db
+time_test.py
+.gitignore
+profile.qdrep

@@ -4,10 +4,10 @@ import time
 import re
 
 
-CHA1_ROOT = Path("/dev/shm/signal-burn/hf25/cha1")
-CHA2_ROOT = Path("/dev/shm/signal-burn/hf25/cha2")
-CHA3_ROOT = Path("/dev/shm/signal-burn/hf25/cha3")
-COH_OUT = Path("/dev/shm/signal-burn/hf25/coherence")
+CHA1_ROOT = Path("/dev/shm/hf25/cha1/data")
+CHA2_ROOT = Path("/dev/shm/hf25/cha2/data")
+CHA3_ROOT = Path("/dev/shm/hf25/cha3/data")
+COH_OUT = Path("/dev/shm/hf25/coherence")
 CACHE_DIR = Path("/pool/signal_storage/cache")
 DATASET_NAME = "rf_data"
 FFT_SIZE = 262144

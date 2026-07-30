@@ -27,15 +27,15 @@ from PyQt5.QtWidgets import QApplication, QMainWindow, QVBoxLayout, QWidget
 from sblib.SignalBurner import SignalBurner
 
 # ----------------------------- defaults ---------------------------------
-CHA1_ROOT = Path("/dev/shm/signal-burn/hf25/cha1")
-CHA2_ROOT = Path("/dev/shm/signal-burn/hf25/cha2")
+CHA1_ROOT = Path("/dev/shm/hf25/cha2/data")
+CHA2_ROOT = Path("/dev/shm/hf25/cha3/data")
 CACHE_DIR = Path("/pool/signal_storage/cache")
 FFT_SIZE = 262144
 FS = 25_000_000  # Hz
 WINDOW_MINUTES = 1.0  # rolling window length
 DATASET_NAME = "rf_data"
 MAX_TIME_DIFF = 0.0  # max timestamp mismatch for pairing
-CLEAR_INPUT_FOLDER = True  # delete existing .h5 files in input folders on start
+CLEAR_INPUT_FOLDER = False  # delete existing .h5 files in input folders on start
 DOWNSAMPLE_DISPLAY = 1  # keep every N-th file in display
 FREQ_DOWNSAMPLE = 64  # downsampling factor on frequency axis (1 = no reduction)
 X_FUTURE = 5.0  # seconds to extend x-axis into the future
@@ -117,12 +117,12 @@ class Worker(QThread):
                     for f in folder.glob("*.h5"):
                         try:
                             f.unlink()
-                        except Exception:
-                            pass
+                        except Exception as e:
+                            print(f"[Worker] Error deleting {f}: {e}")
 
         self.timer = QTimer()
         self.timer.timeout.connect(self._poll)
-        self.timer.start(500)  # ms
+        self.timer.start(900)  # ms
         self.exec_()
         self.sb.shutdown()
         print("[Worker] Stopped.")
@@ -330,7 +330,7 @@ class MainWindow(QMainWindow):
             self.plots.append(pw)
             self.img_items.append(img)
 
-        self.setGeometry(100, 100, 1800, 600)
+        self.setGeometry(100, 100, 900, 900)
 
         self.latest_data = None
 
@@ -433,9 +433,7 @@ def main():
     parser.add_argument("--window", type=float, default=WINDOW_MINUTES)
     parser.add_argument("--dataset", default=DATASET_NAME)
     parser.add_argument("--max-diff", type=float, default=MAX_TIME_DIFF)
-    parser.add_argument(
-        "--clear-input", action="store_true", default=CLEAR_INPUT_FOLDER
-    )
+    parser.add_argument("--clear-input", type=bool, default=CLEAR_INPUT_FOLDER)
     parser.add_argument("--downsample", type=int, default=DOWNSAMPLE_DISPLAY)
     parser.add_argument("--freq-downsample", type=int, default=FREQ_DOWNSAMPLE)
     parser.add_argument("--x-future", type=float, default=X_FUTURE)
