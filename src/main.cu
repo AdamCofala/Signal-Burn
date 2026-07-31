@@ -128,10 +128,10 @@ static cufftComplex*   g_d_cross_accum = nullptr;
 static float*          g_d_cross_result= nullptr;
 static int             g_allocated_n_cross = 0;
 static size_t          g_allocated_in2_size = 0;
-static int             g_allocated_coh_n = 0;
 
 static float*          g_d_pow1 = nullptr;
 static float*          g_d_pow2 = nullptr;
+static int             g_allocated_coh_n = 0;  // FIX: track size actually allocated for pow1/pow2
 
 static cufftHandle get_plan(int n) {
     auto it = g_plans.find(n);
@@ -168,6 +168,12 @@ void reallocate_cross_corelation_buffers(int fft_size) {
 }
 
 void reallocate_coherence_buffers(int fft_size) {
+    // FIX: this used to cudaFree+cudaMalloc UNCONDITIONALLY on every call
+    // (3x per second in sb_process_pair_full), even though fft_size never
+    // changes. That made GPU-side timing depend on the CUDA allocator's
+    // internal state instead of the actual computation, producing the
+    // "one pair looks suspiciously fast" symptom. Guard it like every
+    // other reallocate_* function.
     if (fft_size <= g_allocated_coh_n) return;
     if (g_d_pow1) cudaFree(g_d_pow1);
     if (g_d_pow2) cudaFree(g_d_pow2);
@@ -347,7 +353,7 @@ int sb_process_pair_full(const int16_t* in1, const int16_t* in2, size_t num_samp
     // Ensure all required buffers are allocated
     if (fft_size > g_allocated_n)        reallocate_FFT_buffers(fft_size);
     if (fft_size > g_allocated_n_cross)  reallocate_cross_corelation_buffers(fft_size);
-    reallocate_coherence_buffers(fft_size);
+    reallocate_coherence_buffers(fft_size);  // now guarded internally (see above)
     if (num_samples > g_allocated_in_size)  reallocate_input(num_samples);
     if (num_samples > g_allocated_in2_size) reallocate_input2(num_samples);
 
@@ -388,7 +394,11 @@ int sb_process_pair_full(const int16_t* in1, const int16_t* in2, size_t num_samp
         normalize<<<grid, block>>>(g_d_pow2, num_windows, fft_size);
         normalizeComplex<<<grid, block>>>(g_d_cross_accum, num_windows, fft_size);
 
-        // --- Coherence ---
+        // --- Coherence: computed BEFORE gain-correcting pow1/pow2, since
+        // coherence is a scale-invariant ratio and must not see the
+        // display-only gain correction applied below. (FIX, see chat
+        // history: previously calculateCoherence ran AFTER correctGain(4.0f)
+        // had already scaled pow1/pow2 in place, deflating coherence by 16x.)
         calculateCoherence<<<grid, block>>>(g_d_cross_accum, g_d_pow1, g_d_pow2,
                                             g_d_accum, fft_size);
         shiftFFT<<<grid, block>>>(g_d_accum, g_d_result, fft_size);
@@ -409,8 +419,6 @@ int sb_process_pair_full(const int16_t* in1, const int16_t* in2, size_t num_samp
         correctGain<<<grid, block>>>(g_d_accum, 2.0f, fft_size);
         shiftFFT<<<grid, block>>>(g_d_accum, g_d_result, fft_size);
         cudaMemcpy(out_cross_mag, g_d_result, fft_size * sizeof(float), cudaMemcpyDeviceToHost);
-
-
     }
     return 0;
 }
@@ -436,6 +444,7 @@ void sb_shutdown() {
     g_allocated_in_size = 0;
     g_allocated_n_cross = 0;
     g_allocated_in2_size = 0;
+    g_allocated_coh_n = 0;
 }
 
 } // extern "C"

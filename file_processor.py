@@ -48,7 +48,7 @@ CACHE_DIR = Path("/pool/signal_storage/cache")
 DATASET_NAME = "rf_data"
 OUTPUT_DIR = Path("/pool/signal_storage/output")
 SELECTED_FREQUENCIES_HZ = [1e6, 5e6, 10e6]  # example: 1, 5, 10 MHz
-POLL_INTERVAL = 0.5  # seconds between directory scans
+POLL_INTERVAL = 0.4  # seconds between directory scans
 MAX_TIME_DIFF = 0.0  # required timestamp accuracy for pairing
 HEARTBEAT_INTERVAL = 30.0  # seconds between "still alive" status lines
 LOG_RETENTION_DAYS = 14
@@ -261,9 +261,6 @@ class LiveProcessor:
             ts, fp = self.pending[ts_int][ch]
             files.append(fp)
             timestamps.append(ts)
-
-        files.reverse()
-        timestamps.reverse()
 
         # Timestamp matching (dla MAX_TIME_DIFF == 0 muszą być identyczne)
         if self.max_time_diff == 0.0 and not all(

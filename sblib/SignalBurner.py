@@ -1,6 +1,7 @@
 """GPU-accelerated I/Q HDF5 processing library (SignalBurner)."""
 
 import ctypes
+import hashlib
 from pathlib import Path
 import h5py
 import numpy as np
@@ -205,12 +206,28 @@ class SignalBurner:
         }
 
     # -- Cache helpers -------
+    def _file_cache_key(self, p: Path) -> str:
+        """Unique-per-file cache key.
+
+        Using only ``Path.stem`` is NOT safe here: files coming from
+        different source directories (e.g. separate channels cha1/cha2/cha3)
+        can legitimately share the exact same basename/timestamp (that's
+        even required for pairing them by second). Using the bare stem as a
+        cache key then makes two *different* files collide onto the same
+        cache path, silently returning one channel's cached result for
+        another channel's request. We disambiguate by folding in a short
+        hash of the resolved parent directory.
+        """
+        parent_hash = hashlib.sha1(str(p.resolve().parent).encode()).hexdigest()[:8]
+        return f"{p.stem}_{parent_hash}"
+
     def get_cache_file(self, h5_path: Path) -> Optional[Path]:
         """Return cache path for a single-file FFT (`.npy`)."""
         if self.cache_path is None:
             return None
         self.cache_path.mkdir(parents=True, exist_ok=True)
-        return self.cache_path / f"{h5_path.stem}_fft{self.fft_size}.npy"
+        key = self._file_cache_key(h5_path)
+        return self.cache_path / f"{key}_fft{self.fft_size}.npy"
 
     def is_cache_valid(self, h5_path: Path, cache_file: Path) -> bool:
         """Check whether a cache file is newer than its source HDF5."""
@@ -223,9 +240,9 @@ class SignalBurner:
         The actual files will be <base>.npz (full) or <base>_<product>.npy."""
         if not self.use_cache or self.cache_path is None:
             return None
-        stems = sorted([p1.stem, p2.stem])
+        keys = sorted([self._file_cache_key(p1), self._file_cache_key(p2)])
         self.cache_path.mkdir(parents=True, exist_ok=True)
-        return self.cache_path / f"{stems[0]}_{stems[1]}_fft{self.fft_size}"
+        return self.cache_path / f"{keys[0]}_{keys[1]}_fft{self.fft_size}"
 
     def _full_cache_path(self, p1: Path, p2: Path) -> Optional[Path]:
         """Path to the combined `.npz` cache file."""
