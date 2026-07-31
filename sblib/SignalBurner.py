@@ -25,7 +25,7 @@ class SignalBurner:
     use_cache : bool
         Whether to cache results on disk.
     cache_path : Path or None
-        Directory for cached ``.npy`` files.
+        Directory for cached ``.npy`` / ``.npz`` files.
     show_logs : bool
         Print progress messages.
     """
@@ -95,6 +95,19 @@ class SignalBurner:
             ]
             lib.sb_process_coherence.restype = ctypes.c_int
 
+            # sb_process_pair_full
+            lib.sb_process_pair_full.argtypes = [
+                ctypes.POINTER(ctypes.c_int16),  # in1
+                ctypes.POINTER(ctypes.c_int16),  # in2
+                ctypes.c_size_t,  # num_samples
+                ctypes.POINTER(ctypes.c_float),  # out_pow1
+                ctypes.POINTER(ctypes.c_float),  # out_pow2
+                ctypes.POINTER(ctypes.c_float),  # out_cross_mag
+                ctypes.POINTER(ctypes.c_float),  # out_coherence
+                ctypes.c_int,  # fft_size
+            ]
+            lib.sb_process_pair_full.restype = ctypes.c_int
+
             if hasattr(lib, "sb_shutdown"):
                 lib.sb_shutdown.argtypes = []
                 lib.sb_shutdown.restype = None
@@ -115,8 +128,6 @@ class SignalBurner:
 
         if raw.dtype.fields and {"r", "i"}.issubset(raw.dtype.fields):
             if raw.dtype.itemsize == 4 and raw.flags["C_CONTIGUOUS"]:
-                # compound {r:int16, i:int16}, no padding -> already interleaved
-                # in memory as r0,i0,r1,i1,... — zero-copy view, no strided copy
                 data = raw.view(np.int16).ravel()
             else:
                 num_samples = raw.shape[0]
@@ -137,7 +148,6 @@ class SignalBurner:
     # -- GPU runners
     def _run_single(self, data: np.ndarray, num_samples: int) -> np.ndarray:
         """Run single-channel FFT on GPU."""
-
         out = np.empty(self.fft_size, dtype=np.float32)
         ret = self._lib.sb_process_fft(
             data.ctypes.data_as(ctypes.POINTER(ctypes.c_int16)),
@@ -153,7 +163,6 @@ class SignalBurner:
         self, data1: np.ndarray, data2: np.ndarray, num_samples: int, lib_func
     ) -> np.ndarray:
         """Run a two-channel GPU operation (cross or coherence)."""
-
         out = np.empty(self.fft_size, dtype=np.float32)
         ret = lib_func(
             data1.ctypes.data_as(ctypes.POINTER(ctypes.c_int16)),
@@ -166,9 +175,38 @@ class SignalBurner:
             raise RuntimeError(f"GPU pair operation failed (code {ret})")
         return out
 
+    def _run_pair_full(
+        self, data1: np.ndarray, data2: np.ndarray, num_samples: int
+    ) -> dict:
+        """Execute the combined GPU operation returning all spectra."""
+        pow1 = np.empty(self.fft_size, dtype=np.float32)
+        pow2 = np.empty(self.fft_size, dtype=np.float32)
+        cross_mag = np.empty(self.fft_size, dtype=np.float32)
+        coherence = np.empty(self.fft_size, dtype=np.float32)
+
+        ret = self._lib.sb_process_pair_full(
+            data1.ctypes.data_as(ctypes.POINTER(ctypes.c_int16)),
+            data2.ctypes.data_as(ctypes.POINTER(ctypes.c_int16)),
+            ctypes.c_size_t(num_samples),
+            pow1.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+            pow2.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+            cross_mag.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+            coherence.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+            ctypes.c_int(self.fft_size),
+        )
+        if ret != 0:
+            raise RuntimeError(f"sb_process_pair_full failed (code {ret})")
+
+        return {
+            "power1": pow1,
+            "power2": pow2,
+            "cross_magnitude": cross_mag,
+            "coherence": coherence,
+        }
+
     # -- Cache helpers -------
     def get_cache_file(self, h5_path: Path) -> Optional[Path]:
-        """Return cache path for a single-file FFT."""
+        """Return cache path for a single-file FFT (`.npy`)."""
         if self.cache_path is None:
             return None
         self.cache_path.mkdir(parents=True, exist_ok=True)
@@ -180,12 +218,26 @@ class SignalBurner:
             os.path.getmtime(cache_file) >= os.path.getmtime(h5_path)
         )
 
-    def _pair_cache_file(self, p1: Path, p2: Path, tag: str) -> Optional[Path]:
-        """Return cache path for a pair operation."""
+    def _pair_base_path(self, p1: Path, p2: Path) -> Optional[Path]:
+        """Return base cache path (without extension) for a pair.
+        The actual files will be <base>.npz (full) or <base>_<product>.npy."""
         if not self.use_cache or self.cache_path is None:
             return None
         stems = sorted([p1.stem, p2.stem])
-        return self.cache_path / f"{stems[0]}_{stems[1]}_{tag}_fft{self.fft_size}.npy"
+        self.cache_path.mkdir(parents=True, exist_ok=True)
+        return self.cache_path / f"{stems[0]}_{stems[1]}_fft{self.fft_size}"
+
+    def _full_cache_path(self, p1: Path, p2: Path) -> Optional[Path]:
+        """Path to the combined `.npz` cache file."""
+        base = self._pair_base_path(p1, p2)
+        return base.with_suffix(".npz") if base else None
+
+    def _is_pair_cache_fresh(self, p1: Path, p2: Path, cache_file: Path) -> bool:
+        """Check if a pair cache file is newer than both source HDF5 files."""
+        if not cache_file.exists():
+            return False
+        mtime_c = cache_file.stat().st_mtime
+        return mtime_c >= os.path.getmtime(p1) and mtime_c >= os.path.getmtime(p2)
 
     # -- Public processing methods
     def process_file(self, h5_path: Path) -> np.ndarray:
@@ -210,43 +262,76 @@ class SignalBurner:
 
     def process_cross(self, h5_path1: Path, h5_path2: Path) -> np.ndarray:
         """Cross-spectrum magnitude between two HDF5 files."""
-        cache_file = self._pair_cache_file(h5_path1, h5_path2, "cross")
-        if cache_file and cache_file.exists():
-            mtime1 = os.path.getmtime(h5_path1)
-            mtime2 = os.path.getmtime(h5_path2)
-            if cache_file.stat().st_mtime >= max(mtime1, mtime2):
+        # 1. Try the combined cache first
+        full_npz = self._full_cache_path(h5_path1, h5_path2)
+        if full_npz and self._is_pair_cache_fresh(h5_path1, h5_path2, full_npz):
+            if self.show_logs:
+                print(f"Using full cache for {h5_path1.name} & {h5_path2.name}")
+            data = np.load(full_npz)
+            return data["cross_mag"]
+
+        # 2. Fallback to old single-product cache
+        old_cache = self._pair_base_path(h5_path1, h5_path2)
+        if old_cache:
+            old_cache = old_cache.with_name(old_cache.name + "_cross.npy")
+            if self._is_pair_cache_fresh(h5_path1, h5_path2, old_cache):
                 if self.show_logs:
                     print(
                         f"Loading cached cross-spectrum for {h5_path1.name} & {h5_path2.name}..."
                     )
-                return np.load(cache_file)
+                return np.load(old_cache)
 
-        data1, nsamp1 = self.load_iq_data(h5_path1)
-        data2, nsamp2 = self.load_iq_data(h5_path2)
-        if nsamp1 != nsamp2:
-            raise ValueError(f"Sample count mismatch: {nsamp1} vs {nsamp2}")
-        if nsamp1 == 0:
-            raise ValueError("No samples in input files.")
-
-        out = self._run_pair(data1, data2, nsamp1, self._lib.sb_process_cross_fft)
-
-        if cache_file:
-            self.cache_path.mkdir(parents=True, exist_ok=True)
-            np.save(cache_file, out)
-        return out
+        # 3. Compute full pair and cache it
+        all_res = self.process_pair_all(h5_path1, h5_path2)
+        return all_res["cross_magnitude"]
 
     def process_coherence(self, h5_path1: Path, h5_path2: Path) -> np.ndarray:
         """Magnitude-squared coherence between two HDF5 files."""
-        cache_file = self._pair_cache_file(h5_path1, h5_path2, "coherence")
-        if cache_file and cache_file.exists():
-            mtime1 = os.path.getmtime(h5_path1)
-            mtime2 = os.path.getmtime(h5_path2)
-            if cache_file.stat().st_mtime >= max(mtime1, mtime2):
+        # 1. Try the combined cache first
+        full_npz = self._full_cache_path(h5_path1, h5_path2)
+        if full_npz and self._is_pair_cache_fresh(h5_path1, h5_path2, full_npz):
+            if self.show_logs:
+                print(f"Using full cache for {h5_path1.name} & {h5_path2.name}")
+            data = np.load(full_npz)
+            return data["coherence"]
+
+        # 2. Fallback to old single-product cache
+        old_cache = self._pair_base_path(h5_path1, h5_path2)
+        if old_cache:
+            old_cache = old_cache.with_name(old_cache.name + "_coherence.npy")
+            if self._is_pair_cache_fresh(h5_path1, h5_path2, old_cache):
                 if self.show_logs:
                     print(
                         f"Loading cached coherence for {h5_path1.name} & {h5_path2.name}..."
                     )
-                return np.load(cache_file)
+                return np.load(old_cache)
+
+        # 3. Compute full pair and cache it
+        all_res = self.process_pair_all(h5_path1, h5_path2)
+        return all_res["coherence"]
+
+    def process_pair_all(self, h5_path1: Path, h5_path2: Path) -> dict:
+        """Compute all pair products in a single GPU pass.
+
+        Returns a dictionary with keys:
+            'power1'         – power spectrum of channel 1
+            'power2'         – power spectrum of channel 2
+            'cross_magnitude'– cross-spectrum magnitude
+            'coherence'      – magnitude-squared coherence
+        """
+        full_npz = self._full_cache_path(h5_path1, h5_path2)
+        if full_npz and self._is_pair_cache_fresh(h5_path1, h5_path2, full_npz):
+            if self.show_logs:
+                print(
+                    f"Loading cached full pair for {h5_path1.name} & {h5_path2.name}..."
+                )
+            data = np.load(full_npz)
+            return {
+                "power1": data["power1"],
+                "power2": data["power2"],
+                "cross_magnitude": data["cross_mag"],
+                "coherence": data["coherence"],
+            }
 
         data1, nsamp1 = self.load_iq_data(h5_path1)
         data2, nsamp2 = self.load_iq_data(h5_path2)
@@ -255,12 +340,17 @@ class SignalBurner:
         if nsamp1 == 0:
             raise ValueError("No samples in input files.")
 
-        out = self._run_pair(data1, data2, nsamp1, self._lib.sb_process_coherence)
+        results = self._run_pair_full(data1, data2, nsamp1)
 
-        if cache_file:
-            self.cache_path.mkdir(parents=True, exist_ok=True)
-            np.save(cache_file, out)
-        return out
+        if self.use_cache and full_npz:
+            np.savez(
+                full_npz,
+                power1=results["power1"],
+                power2=results["power2"],
+                cross_mag=results["cross_magnitude"],
+                coherence=results["coherence"],
+            )
+        return results
 
     # -- Batch processing ---
     def process_fft_files(self, folder: Path) -> List[Tuple[Path, np.ndarray]]:
@@ -373,13 +463,14 @@ class SignalBurner:
             self._lib.sb_shutdown()
 
     def clean_cache(self, max_age_minutes: int = 30) -> int:
-        """Remove cached ``.npy`` files older than *max_age_minutes*."""
+        """Remove cached ``.npy`` / ``.npz`` files older than *max_age_minutes*."""
         if self.cache_path is None or not self.cache_path.exists():
             return 0
         now = time.time()
         deleted = 0
-        for f in self.cache_path.glob("*.npy"):
-            if now - f.stat().st_mtime > max_age_minutes * 60:
-                f.unlink()
-                deleted += 1
+        for pattern in ("*.npy", "*.npz"):
+            for f in self.cache_path.glob(pattern):
+                if now - f.stat().st_mtime > max_age_minutes * 60:
+                    f.unlink()
+                    deleted += 1
         return deleted

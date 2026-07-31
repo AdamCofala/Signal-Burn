@@ -334,6 +334,82 @@ int sb_process_coherence(const int16_t* in1, const int16_t* in2, size_t num_samp
     return 0;
 }
 
+int sb_process_pair_full(const int16_t* in1, const int16_t* in2, size_t num_samples,
+                         float* out_pow1, float* out_pow2,
+                         float* out_cross_mag, float* out_coherence,
+                         int fft_size) {
+    if (num_samples < (size_t)fft_size) return -1;
+    std::lock_guard<std::mutex> lock(g_state_mutex);
+
+    // Ensure all required buffers are allocated
+    if (fft_size > g_allocated_n)        reallocate_FFT_buffers(fft_size);
+    if (fft_size > g_allocated_n_cross)  reallocate_cross_corelation_buffers(fft_size);
+    reallocate_coherence_buffers(fft_size);
+    if (num_samples > g_allocated_in_size)  reallocate_input(num_samples);
+    if (num_samples > g_allocated_in2_size) reallocate_input2(num_samples);
+
+    // Copy input data
+    cudaMemcpy(g_d_in,  in1, num_samples * sizeof(IQSample), cudaMemcpyHostToDevice);
+    cudaMemcpy(g_d_in2, in2, num_samples * sizeof(IQSample), cudaMemcpyHostToDevice);
+
+    // Initialize accumulators
+    cudaMemset(g_d_pow1,        0, fft_size * sizeof(float));
+    cudaMemset(g_d_pow2,        0, fft_size * sizeof(float));
+    cudaMemset(g_d_cross_accum, 0, fft_size * sizeof(cufftComplex));
+
+    int num_windows = 0;
+    int stride = fft_size / 2;
+    cufftHandle plan = get_plan(fft_size);
+    if (plan == 0) return -2;
+
+    dim3 block(256);
+    dim3 grid((fft_size + 255) / 256);
+
+    for (size_t offset = 0; offset + fft_size <= num_samples; offset += stride) {
+        // Channel 1: FFT + power, save FFT for cross
+        process_single_window(g_d_in, (int)offset, g_d_fft, g_d_pow, g_d_fft_saved, fft_size, plan);
+        accumulate<<<grid, block>>>(g_d_pow, g_d_pow1, fft_size);
+
+        // Channel 2: FFT + power, no save needed
+        process_single_window(g_d_in2, (int)offset, g_d_fft, g_d_pow, nullptr, fft_size, plan);
+        accumulate<<<grid, block>>>(g_d_pow, g_d_pow2, fft_size);
+
+        // Cross accumulate
+        crossAccumulate<<<grid, block>>>(g_d_fft_saved, g_d_fft, g_d_cross_accum, fft_size);
+        num_windows++;
+    }
+
+    if (num_windows > 0) {
+        // Normalize everything
+        normalize<<<grid, block>>>(g_d_pow1, num_windows, fft_size);
+        normalize<<<grid, block>>>(g_d_pow2, num_windows, fft_size);
+        normalizeComplex<<<grid, block>>>(g_d_cross_accum, num_windows, fft_size);
+
+        // --- Power spectrum 1 ---
+        correctGain<<<grid, block>>>(g_d_pow1, 4.0f, fft_size);
+        shiftFFT<<<grid, block>>>(g_d_pow1, g_d_result, fft_size);
+        cudaMemcpy(out_pow1, g_d_result, fft_size * sizeof(float), cudaMemcpyDeviceToHost);
+
+        // --- Power spectrum 2 ---
+        correctGain<<<grid, block>>>(g_d_pow2, 4.0f, fft_size);
+        shiftFFT<<<grid, block>>>(g_d_pow2, g_d_result, fft_size);
+        cudaMemcpy(out_pow2, g_d_result, fft_size * sizeof(float), cudaMemcpyDeviceToHost);
+
+        // --- Cross magnitude ---
+        magnitude<<<grid, block>>>(g_d_cross_accum, g_d_accum, fft_size);
+        correctGain<<<grid, block>>>(g_d_accum, 2.0f, fft_size);
+        shiftFFT<<<grid, block>>>(g_d_accum, g_d_result, fft_size);
+        cudaMemcpy(out_cross_mag, g_d_result, fft_size * sizeof(float), cudaMemcpyDeviceToHost);
+
+        // --- Coherence ---
+        calculateCoherence<<<grid, block>>>(g_d_cross_accum, g_d_pow1, g_d_pow2,
+                                            g_d_accum, fft_size);
+        shiftFFT<<<grid, block>>>(g_d_accum, g_d_result, fft_size);
+        cudaMemcpy(out_coherence, g_d_result, fft_size * sizeof(float), cudaMemcpyDeviceToHost);
+    }
+    return 0;
+}
+
 void sb_shutdown() {
     std::lock_guard<std::mutex> lock(g_state_mutex);
     for (auto& kv : g_plans) cufftDestroy(kv.second);

@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """
-Real‑time I/Q processor for channels /hf25/cha*/data
+Real-time I/Q processor for channels /hf25/cha*/data
 
 - Ignores files present at startup, processes only **new** ones.
 - Every **second**: saves FFT amplitudes at selected frequencies to CSV.
 - Every **minute** (when timestamp % 60 == 0): saves the **single packet** that
-  arrived at that second – full FFT (all bins) and coherence for 3 channel pairs
-  – into an HDF5 file, and prints a timing summary.
+  arrived at that second - full FFT (all bins) and coherence for 3 channel pairs
+  - into an HDF5 file, and prints a timing summary.
 - On exit: shuts down SignalBurner and optionally kills leftover Python
   processes on the GPU to ensure a clean state for future runs.
 """
@@ -94,18 +94,19 @@ class LiveProcessor:
             idx = np.argmin(np.abs(freq_axis - f_hz))
             self.selected_bins.append(idx)
 
-        # SignalBurner engine
+        # SignalBurner engine - cache włączony, by przy ponownym przetwarzaniu
+        # tego samego zestawu plików (np. restart) odczytywać gotowe wyniki z .npz
         t0 = time.perf_counter()
         self.sb = SignalBurner(
             fft_size=fft_size,
             dataset_name=dataset_name,
             cache_path=cache_dir,
-            use_cache=False,
+            use_cache=True,
             show_logs=False,
         )
         print(f"[init] SignalBurner ready ({time.perf_counter() - t0:.4f}s)")
 
-        # Incremental discovery – "seen" set per channel
+        # Incremental discovery - "seen" set per channel
         self.seen = [dict() for _ in range(self.num_channels)]
         for ch in range(self.num_channels):
             self._ignore_existing_files(ch)
@@ -149,10 +150,11 @@ class LiveProcessor:
             print(f"[discover] cha{channel_idx + 1}: {new_count} new file(s)")
 
     def _process_second(self, ts_int: int):
-        """Process one second: FFTs + coherences, per-second CSV, minute snapshot if applicable."""
+        """Process one second using the new combined pair processing."""
         if len(self.pending[ts_int]) < self.num_channels:
             return False
 
+        # Collect files for all channels (order zgodny z oryginałem)
         files = []
         timestamps = []
         for ch in range(self.num_channels):
@@ -160,10 +162,10 @@ class LiveProcessor:
             files.append(fp)
             timestamps.append(ts)
 
-        files.reverse()  # optional: process in reverse channel order for timing comparison
+        files.reverse()
         timestamps.reverse()
 
-        # Timestamp matching
+        # Timestamp matching (dla MAX_TIME_DIFF == 0 muszą być identyczne)
         if self.max_time_diff == 0.0 and not all(
             abs(t - timestamps[0]) < 1e-9 for t in timestamps[1:]
         ):
@@ -174,43 +176,50 @@ class LiveProcessor:
         total_start = time.perf_counter()
 
         try:
-            # 1) per-channel FFT
-            ffts = []
-            fft_times = []
-            for fp in files:
-                t0 = time.perf_counter()
-                mag = self.sb.process_file(fp)
-                dt = time.perf_counter() - t0
-                fft_times.append(dt)
-                ffts.append(mag)
-
-            # 2) coherence for 3 pairs
+            # Miejsca na wyniki
+            ffts = {idx: None for idx in range(self.num_channels)}
+            fft_times = {idx: 0.0 for idx in range(self.num_channels)}
             coh_pairs = []
             pair_labels = []
             coh_times = []
-            if ts_int % 60 == 0:
-                for i in range(self.num_channels):
-                    for j in range(i + 1, self.num_channels):
-                        t0 = time.perf_counter()
-                        coh = self.sb.process_coherence(files[i], files[j])
-                        dt = time.perf_counter() - t0
-                        coh_times.append(dt)
-                        coh_pairs.append(coh)
-                        pair_labels.append((i, j))
 
-            # Write per-second CSV (selected frequencies)
-            self._write_second_log(ts_int, ffts)
+            need_coh = ts_int % 60 == 0  # tylko na granicy minuty zapisujemy koherencję
+
+            # Pary: (0,1), (0,2), (1,2)
+            pair_indices = [(0, 1), (0, 2), (1, 2)]
+
+            for i, j in pair_indices:
+                t0 = time.perf_counter()
+                res = self.sb.process_pair_all(files[i], files[j])
+                dt = time.perf_counter() - t0
+
+                # Zapamiętaj widma mocy (jeśli jeszcze nie mamy)
+                if ffts[i] is None:
+                    ffts[i] = res["power1"]
+                    fft_times[i] = dt  # przybliżenie, ale wystarczające do podsumowania
+                if ffts[j] is None:
+                    ffts[j] = res["power2"]
+                    fft_times[j] = dt
+
+                # Dla podsumowania minutowego zbieramy koherencję
+                if need_coh:
+                    coh_pairs.append(res["coherence"])
+                    coh_times.append(dt)
+                    pair_labels.append((i, j))
+
+            # Mamy już wszystkie trzy widma mocy -> piszemy CSV
+            self._write_second_log(ts_int, [ffts[i] for i in range(self.num_channels)])
 
             total_time = time.perf_counter() - total_start
 
-            # Minute‑boundary snapshot
-            if ts_int % 60 == 0:
+            # Snapshot minutowy
+            if need_coh:
                 self._save_minute_snapshot(
                     ts_int,
-                    ffts,
+                    [ffts[i] for i in range(self.num_channels)],
                     coh_pairs,
                     pair_labels,
-                    fft_times,
+                    [fft_times[i] for i in range(self.num_channels)],
                     coh_times,
                     total_time,
                 )
@@ -219,12 +228,12 @@ class LiveProcessor:
             return True
 
         except FileNotFoundError as e:
-            print(f"[error] second {ts_int}: file not found – {e}. Skipping.")
+            print(f"[error] second {ts_int}: file not found - {e}. Skipping.")
             if ts_int in self.pending:
                 del self.pending[ts_int]
             return False
         except Exception as e:
-            print(f"[error] second {ts_int}: unexpected – {e}. Skipping.")
+            print(f"[error] second {ts_int}: unexpected - {e}. Skipping.")
             if ts_int in self.pending:
                 del self.pending[ts_int]
             return False
@@ -250,7 +259,7 @@ class LiveProcessor:
     def _save_minute_snapshot(
         self, ts_int, ffts, coh_pairs, pair_labels, fft_times, coh_times, total_time
     ):
-        """Save a single‑second snapshot to HDF5 and print a summary."""
+        """Save a single-second snapshot to HDF5 and print a summary."""
         minute_start = (ts_int // 60) * 60
         h5_path = self.minute_h5_dir / f"minute_{minute_start}.h5"
 
@@ -322,6 +331,9 @@ class LiveProcessor:
                     if now - ts_int > 10:
                         del self.pending[ts_int]
 
+                # 4. Clean sb cache (optional, can be commented out if not needed)
+                self.sb.clean_cache(5)
+
                 elapsed = time.perf_counter() - loop_start
                 time.sleep(max(0, self.poll_interval - elapsed))
 
@@ -375,7 +387,7 @@ class LiveProcessor:
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Real‑time I/Q processor")
+    parser = argparse.ArgumentParser(description="Real-time I/Q processor")
     parser.add_argument("--cha-roots", nargs="+", type=Path, default=CHA_ROOTS)
     parser.add_argument("--fft-size", type=int, default=FFT_SIZE)
     parser.add_argument("--fs", type=float, default=FS)

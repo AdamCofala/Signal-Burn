@@ -94,7 +94,7 @@ def main():
         cache_path=CACHE_DIR,
         dataset_name=DATASET_NAME,
         fft_size=FFT_SIZE,
-        use_cache=False,
+        use_cache=True,
         show_logs=False,
     )
 
