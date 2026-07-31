@@ -30,7 +30,7 @@ plt.rcParams.update(
         "xtick.direction": "out",
         "ytick.direction": "out",
         "legend.fontsize": 10,
-        "figure.dpi": 100,
+        "figure.dpi": 300,
         "savefig.bbox": "tight",
     }
 )
@@ -150,7 +150,9 @@ def plot_spectrogram(
         vmin=vmin,
         vmax=vmax,
         cmap=cmap,
+        interpolation="nearest",
     )
+
     # Shift Y-axis labels by +12.5 MHz so the display reads 0-25 MHz,
     # with clean, evenly-spaced ticks every 2.5 MHz (0, 2.5, 5, ..., 25).
     ax.yaxis.set_major_locator(ticker.MultipleLocator(2.5))

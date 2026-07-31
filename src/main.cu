@@ -394,11 +394,7 @@ int sb_process_pair_full(const int16_t* in1, const int16_t* in2, size_t num_samp
         normalize<<<grid, block>>>(g_d_pow2, num_windows, fft_size);
         normalizeComplex<<<grid, block>>>(g_d_cross_accum, num_windows, fft_size);
 
-        // --- Coherence: computed BEFORE gain-correcting pow1/pow2, since
-        // coherence is a scale-invariant ratio and must not see the
-        // display-only gain correction applied below. (FIX, see chat
-        // history: previously calculateCoherence ran AFTER correctGain(4.0f)
-        // had already scaled pow1/pow2 in place, deflating coherence by 16x.)
+        // --- Coherence: computed BEFORE gain-correcting pow1/pow2
         calculateCoherence<<<grid, block>>>(g_d_cross_accum, g_d_pow1, g_d_pow2,
                                             g_d_accum, fft_size);
         shiftFFT<<<grid, block>>>(g_d_accum, g_d_result, fft_size);

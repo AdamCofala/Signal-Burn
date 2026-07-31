@@ -171,7 +171,7 @@ class LiveProcessor:
             dataset_name=dataset_name,
             cache_path=cache_dir,
             use_cache=True,
-            show_logs=False,
+            show_logs=True,
         )
         logger.info(
             "SignalBurner engine ready in %.3fs (fft_size=%d, fs=%.3f MHz)",
@@ -254,7 +254,8 @@ class LiveProcessor:
         if len(self.pending[ts_int]) < self.num_channels:
             return False
 
-        # Collect files for all channels (order zgodny z oryginałem)
+        # Collect files for all channels (kolejność zgodna z self.cha_roots:
+        # 0->cha1, 1->cha2, 2->cha3)
         files = []
         timestamps = []
         for ch in range(self.num_channels):
@@ -292,6 +293,7 @@ class LiveProcessor:
 
             for i, j in pair_indices:
                 t0 = time.perf_counter()
+                cache_key = self.sb._full_cache_path(files[i], files[j])
                 res = self.sb.process_pair_all(files[i], files[j])
                 dt = time.perf_counter() - t0
 
@@ -477,7 +479,7 @@ class LiveProcessor:
                     del self.pending[ts_int]
 
                 # 4. Clean sb cache (optional, can be commented out if not needed)
-                removed = self.sb.clean_cache(5)
+                removed = self.sb.clean_cache(2)
                 if removed:
                     logger.debug("Cache cleanup removed %d stale file(s)", removed)
 
