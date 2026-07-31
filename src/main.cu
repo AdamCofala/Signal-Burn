@@ -128,6 +128,7 @@ static cufftComplex*   g_d_cross_accum = nullptr;
 static float*          g_d_cross_result= nullptr;
 static int             g_allocated_n_cross = 0;
 static size_t          g_allocated_in2_size = 0;
+static int             g_allocated_coh_n = 0;
 
 static float*          g_d_pow1 = nullptr;
 static float*          g_d_pow2 = nullptr;
@@ -167,10 +168,12 @@ void reallocate_cross_corelation_buffers(int fft_size) {
 }
 
 void reallocate_coherence_buffers(int fft_size) {
+    if (fft_size <= g_allocated_coh_n) return;
     if (g_d_pow1) cudaFree(g_d_pow1);
     if (g_d_pow2) cudaFree(g_d_pow2);
     cudaMalloc(&g_d_pow1, fft_size * sizeof(float));
     cudaMalloc(&g_d_pow2, fft_size * sizeof(float));
+    g_allocated_coh_n = fft_size;
 }
 
 void reallocate_input(size_t num_samples) {
@@ -385,6 +388,12 @@ int sb_process_pair_full(const int16_t* in1, const int16_t* in2, size_t num_samp
         normalize<<<grid, block>>>(g_d_pow2, num_windows, fft_size);
         normalizeComplex<<<grid, block>>>(g_d_cross_accum, num_windows, fft_size);
 
+        // --- Coherence ---
+        calculateCoherence<<<grid, block>>>(g_d_cross_accum, g_d_pow1, g_d_pow2,
+                                            g_d_accum, fft_size);
+        shiftFFT<<<grid, block>>>(g_d_accum, g_d_result, fft_size);
+        cudaMemcpy(out_coherence, g_d_result, fft_size * sizeof(float), cudaMemcpyDeviceToHost);
+
         // --- Power spectrum 1 ---
         correctGain<<<grid, block>>>(g_d_pow1, 4.0f, fft_size);
         shiftFFT<<<grid, block>>>(g_d_pow1, g_d_result, fft_size);
@@ -401,11 +410,7 @@ int sb_process_pair_full(const int16_t* in1, const int16_t* in2, size_t num_samp
         shiftFFT<<<grid, block>>>(g_d_accum, g_d_result, fft_size);
         cudaMemcpy(out_cross_mag, g_d_result, fft_size * sizeof(float), cudaMemcpyDeviceToHost);
 
-        // --- Coherence ---
-        calculateCoherence<<<grid, block>>>(g_d_cross_accum, g_d_pow1, g_d_pow2,
-                                            g_d_accum, fft_size);
-        shiftFFT<<<grid, block>>>(g_d_accum, g_d_result, fft_size);
-        cudaMemcpy(out_coherence, g_d_result, fft_size * sizeof(float), cudaMemcpyDeviceToHost);
+
     }
     return 0;
 }

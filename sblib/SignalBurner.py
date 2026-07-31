@@ -32,9 +32,9 @@ class SignalBurner:
 
     def __init__(
         self,
-        cache_path: Optional[Path] = None,
-        dataset_name: Optional[str] = None,
-        lib_path: Optional[Path] = None,
+        cache_path: Path | None = None,
+        dataset_name: Path | None = None,
+        lib_path: Path | None = None,
         fft_size: int = 8192,
         use_cache: bool = True,
         show_logs: bool = False,
@@ -314,10 +314,10 @@ class SignalBurner:
         """Compute all pair products in a single GPU pass.
 
         Returns a dictionary with keys:
-            'power1'         – power spectrum of channel 1
-            'power2'         – power spectrum of channel 2
-            'cross_magnitude'– cross-spectrum magnitude
-            'coherence'      – magnitude-squared coherence
+            'power1'         - power spectrum of channel 1
+            'power2'         - power spectrum of channel 2
+            'cross_magnitude'- cross-spectrum magnitude
+            'coherence'      - magnitude-squared coherence
         """
         full_npz = self._full_cache_path(h5_path1, h5_path2)
         if full_npz and self._is_pair_cache_fresh(h5_path1, h5_path2, full_npz):

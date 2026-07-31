@@ -6,16 +6,27 @@ Real-time I/Q processor for channels /hf25/cha*/data
 - Every **second**: saves FFT amplitudes at selected frequencies to CSV.
 - Every **minute** (when timestamp % 60 == 0): saves the **single packet** that
   arrived at that second - full FFT (all bins) and coherence for 3 channel pairs
-  - into an HDF5 file, and prints a timing summary.
+  - into an HDF5 file, and logs a timing summary.
 - On exit: shuts down SignalBurner and optionally kills leftover Python
   processes on the GPU to ensure a clean state for future runs.
+
+Logging
+-------
+- Console: concise, INFO level by default (use --verbose for DEBUG).
+- File: full DEBUG-level log, rotated daily, kept for --log-retention-days
+  (default 14), stored under <output>/logs/live_processor.log.
+- A periodic heartbeat line is emitted every --heartbeat-interval seconds
+  (default 30s) so it's obvious the process is alive even when idle.
 """
 
 import argparse
 import csv
+import logging
+import logging.handlers
 import re
 import signal
 import subprocess
+import sys
 import time
 from collections import defaultdict
 from pathlib import Path
@@ -39,7 +50,56 @@ OUTPUT_DIR = Path("/pool/signal_storage/output")
 SELECTED_FREQUENCIES_HZ = [1e6, 5e6, 10e6]  # example: 1, 5, 10 MHz
 POLL_INTERVAL = 0.5  # seconds between directory scans
 MAX_TIME_DIFF = 0.0  # required timestamp accuracy for pairing
+HEARTBEAT_INTERVAL = 30.0  # seconds between "still alive" status lines
+LOG_RETENTION_DAYS = 14
 # -----------------------------------------------------------
+
+logger = logging.getLogger("sdr_live")
+
+
+def setup_logging(output_dir: Path, verbose: bool, retention_days: int) -> None:
+    """Configure console + rotating file logging.
+
+    Console gets INFO (or DEBUG with --verbose); the log file always gets
+    DEBUG so nothing is lost for later diagnostics, even if the console is
+    kept quiet during normal operation.
+    """
+    logger.setLevel(logging.DEBUG)
+    logger.handlers.clear()
+
+    console_fmt = logging.Formatter(
+        fmt="%(asctime)s %(levelname)-7s %(message)s", datefmt="%H:%M:%S"
+    )
+    file_fmt = logging.Formatter(
+        fmt="%(asctime)s %(levelname)-7s [%(funcName)s] %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
+
+    console = logging.StreamHandler(sys.stdout)
+    console.setLevel(logging.DEBUG if verbose else logging.INFO)
+    console.setFormatter(console_fmt)
+    logger.addHandler(console)
+
+    log_dir = output_dir / "logs"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    log_path = log_dir / "live_processor.log"
+
+    file_handler = logging.handlers.TimedRotatingFileHandler(
+        filename=str(log_path),
+        when="midnight",
+        backupCount=retention_days,
+        encoding="utf-8",
+    )
+    file_handler.setLevel(logging.DEBUG)
+    file_handler.setFormatter(file_fmt)
+    logger.addHandler(file_handler)
+
+    logger.info(
+        "Logging initialised -> console=%s, file=%s (retention=%dd)",
+        "DEBUG" if verbose else "INFO",
+        log_path,
+        retention_days,
+    )
 
 
 def latest_input_dir(base: Path) -> Path:
@@ -60,6 +120,13 @@ def parse_timestamp(filename: Path) -> float:
     return int(m.group(1)) + int(m.group(2)) / 1000.0
 
 
+def is_temp_file(fp: Path) -> bool:
+    """True for in-progress writer artifacts like 'tmp.rf@....h5' that should
+    never be picked up - they get renamed to their final name once the
+    writer finishes, and will be discovered normally at that point."""
+    return fp.name.startswith("tmp.")
+
+
 class LiveProcessor:
     def __init__(
         self,
@@ -72,6 +139,7 @@ class LiveProcessor:
         selected_freqs_hz,
         poll_interval,
         max_time_diff,
+        heartbeat_interval=HEARTBEAT_INTERVAL,
     ):
         self.cha_roots = [Path(p) for p in cha_roots]
         self.num_channels = len(self.cha_roots)
@@ -81,6 +149,7 @@ class LiveProcessor:
         self.selected_freqs_hz = selected_freqs_hz
         self.poll_interval = poll_interval
         self.max_time_diff = max_time_diff
+        self.heartbeat_interval = heartbeat_interval
 
         # Create output directories
         self.second_log_path = self.output_dir / "second_fft.csv"
@@ -104,30 +173,55 @@ class LiveProcessor:
             use_cache=True,
             show_logs=False,
         )
-        print(f"[init] SignalBurner ready ({time.perf_counter() - t0:.4f}s)")
+        logger.info(
+            "SignalBurner engine ready in %.3fs (fft_size=%d, fs=%.3f MHz)",
+            time.perf_counter() - t0,
+            fft_size,
+            fs / 1e6,
+        )
 
         # Incremental discovery - "seen" set per channel
         self.seen = [dict() for _ in range(self.num_channels)]
+        ignored_counts = []
         for ch in range(self.num_channels):
-            self._ignore_existing_files(ch)
+            ignored_counts.append(self._ignore_existing_files(ch))
+        logger.info(
+            "Startup scan complete - ignored existing files per channel: %s (total=%d)",
+            ", ".join(f"cha{ch + 1}={n}" for ch, n in enumerate(ignored_counts)),
+            sum(ignored_counts),
+        )
 
         # Pending seconds: ts_int -> {channel_idx: (ts, path)}
         self.pending = defaultdict(dict)
 
-    def _ignore_existing_files(self, channel_idx: int):
+        # Runtime counters used for the heartbeat line
+        self._start_time = time.time()
+        self._last_heartbeat = self._start_time
+        self._seconds_processed = 0
+        self._minutes_saved = 0
+        self._last_minute_saved_at = None
+        self._discovered_since_heartbeat = 0
+        self._errors_since_heartbeat = 0
+
+    def _ignore_existing_files(self, channel_idx: int) -> int:
         """Add all existing .h5 files to 'seen' to exclude from processing."""
         root = self.cha_roots[channel_idx]
         cur_dir = latest_input_dir(root)
         cnt = 0
         for fp in cur_dir.glob("*.h5"):
+            if is_temp_file(fp):
+                continue
             stem = fp.stem
             try:
                 ts = parse_timestamp(fp)
             except ValueError:
+                logger.debug(
+                    "Skipping unparseable filename during startup scan: %s", fp.name
+                )
                 continue
             self.seen[channel_idx][stem] = (ts, fp)
             cnt += 1
-        print(f"[init] Channel {channel_idx + 1}: ignored {cnt} existing file(s)")
+        return cnt
 
     def _add_new_files(self, channel_idx: int):
         """Detect new files since last check."""
@@ -135,21 +229,27 @@ class LiveProcessor:
         cur_dir = latest_input_dir(root)
         new_count = 0
         for fp in cur_dir.glob("*.h5"):
+            if is_temp_file(fp):
+                continue
             stem = fp.stem
             if stem in self.seen[channel_idx]:
                 continue
             try:
                 ts = parse_timestamp(fp)
             except ValueError:
+                logger.warning("Ignoring file with unparseable timestamp: %s", fp.name)
                 continue
             self.seen[channel_idx][stem] = (ts, fp)
             ts_int = int(ts)
             self.pending[ts_int][channel_idx] = (ts, fp)
             new_count += 1
         if new_count:
-            print(f"[discover] cha{channel_idx + 1}: {new_count} new file(s)")
+            logger.debug(
+                "Discovered %d new file(s) on cha%d", new_count, channel_idx + 1
+            )
+            self._discovered_since_heartbeat += new_count
 
-    def _process_second(self, ts_int: int):
+    def _process_second(self, ts_int: int) -> bool:
         """Process one second using the new combined pair processing."""
         if len(self.pending[ts_int]) < self.num_channels:
             return False
@@ -169,8 +269,13 @@ class LiveProcessor:
         if self.max_time_diff == 0.0 and not all(
             abs(t - timestamps[0]) < 1e-9 for t in timestamps[1:]
         ):
-            print(f"[warn] second {ts_int}: timestamps not identical, skipping")
+            logger.warning(
+                "second %d: timestamps not identical across channels (%s) - skipping",
+                ts_int,
+                timestamps,
+            )
             del self.pending[ts_int]
+            self._errors_since_heartbeat += 1
             return False
 
         total_start = time.perf_counter()
@@ -211,6 +316,7 @@ class LiveProcessor:
             self._write_second_log(ts_int, [ffts[i] for i in range(self.num_channels)])
 
             total_time = time.perf_counter() - total_start
+            logger.debug("second %d processed in %.4fs", ts_int, total_time)
 
             # Snapshot minutowy
             if need_coh:
@@ -225,17 +331,22 @@ class LiveProcessor:
                 )
 
             del self.pending[ts_int]
+            self._seconds_processed += 1
             return True
 
         except FileNotFoundError as e:
-            print(f"[error] second {ts_int}: file not found - {e}. Skipping.")
+            logger.error("second %d: file not found - %s. Skipping.", ts_int, e)
             if ts_int in self.pending:
                 del self.pending[ts_int]
+            self._errors_since_heartbeat += 1
             return False
-        except Exception as e:
-            print(f"[error] second {ts_int}: unexpected - {e}. Skipping.")
+        except Exception:
+            logger.exception(
+                "second %d: unexpected error while processing. Skipping.", ts_int
+            )
             if ts_int in self.pending:
                 del self.pending[ts_int]
+            self._errors_since_heartbeat += 1
             return False
 
     def _write_second_log(self, ts_int, ffts):
@@ -254,12 +365,13 @@ class LiveProcessor:
                     for f_hz in self.selected_freqs_hz:
                         header.append(f"cha{ch}_{f_hz / 1e6:.2f}MHz")
                 writer.writerow(header)
+                logger.debug("Created new CSV log at %s", self.second_log_path)
             writer.writerow(row)
 
     def _save_minute_snapshot(
         self, ts_int, ffts, coh_pairs, pair_labels, fft_times, coh_times, total_time
     ):
-        """Save a single-second snapshot to HDF5 and print a summary."""
+        """Save a single-second snapshot to HDF5 and log a timing summary."""
         minute_start = (ts_int // 60) * 60
         h5_path = self.minute_h5_dir / f"minute_{minute_start}.h5"
 
@@ -285,27 +397,57 @@ class LiveProcessor:
                 },
             )
             dt = time.perf_counter() - t0
-            print(f"[minute] HDF5 saved to {h5_path} in {dt:.4f}s")
-        except Exception as e:
-            print(f"[minute] FAILED to save HDF5: {e}")
+        except Exception:
+            logger.exception("Failed to save minute HDF5 snapshot to %s", h5_path)
+            self._errors_since_heartbeat += 1
             return
 
-        # Print summary
+        self._minutes_saved += 1
+        self._last_minute_saved_at = minute_start
+
         fft_total = sum(fft_times)
         coh_total = sum(coh_times)
-        print(f"[minute] ====== Minute {minute_start} summary ======")
+        summary_lines = [
+            f"Minute {minute_start} snapshot saved -> {h5_path} ({dt:.3f}s)"
+        ]
         for idx, d in enumerate(fft_times):
-            print(f"         FFT cha{idx + 1}: {d:.4f}s")
-        print(f"         FFT total     : {fft_total:.4f}s")
+            summary_lines.append(f"    FFT cha{idx + 1}:        {d:.4f}s")
+        summary_lines.append(f"    FFT total:        {fft_total:.4f}s")
         for idx, d in enumerate(coh_times):
             i, j = pair_labels[idx]
-            print(f"         Coherence {i + 1}-{j + 1}: {d:.4f}s")
-        print(f"         Coherence total: {coh_total:.4f}s")
-        print(f"         Second total   : {total_time:.4f}s")
-        print(f"[minute] ===================================")
+            summary_lines.append(f"    Coherence {i + 1}-{j + 1}:   {d:.4f}s")
+        summary_lines.append(f"    Coherence total:  {coh_total:.4f}s")
+        summary_lines.append(f"    Second total:     {total_time:.4f}s")
+        logger.info("\n".join(summary_lines))
+
+    def _maybe_heartbeat(self):
+        """Emit a periodic 'still alive' status line, regardless of activity."""
+        now = time.time()
+        if now - self._last_heartbeat < self.heartbeat_interval:
+            return
+        uptime = now - self._start_time
+        last_minute = (
+            f"minute_{self._last_minute_saved_at}"
+            if self._last_minute_saved_at is not None
+            else "none yet"
+        )
+        logger.info(
+            "status: alive | uptime=%.0fs | seconds_processed=%d | minutes_saved=%d "
+            "| pending=%d | new_files=%d | errors=%d | last_snapshot=%s",
+            uptime,
+            self._seconds_processed,
+            self._minutes_saved,
+            len(self.pending),
+            self._discovered_since_heartbeat,
+            self._errors_since_heartbeat,
+            last_minute,
+        )
+        self._last_heartbeat = now
+        self._discovered_since_heartbeat = 0
+        self._errors_since_heartbeat = 0
 
     def run(self):
-        print("[main] Processor started. Press Ctrl+C to stop.")
+        logger.info("Processor started. Press Ctrl+C to stop.")
         try:
             while True:
                 loop_start = time.perf_counter()
@@ -327,23 +469,39 @@ class LiveProcessor:
 
                 # 3. Clean up stale incomplete seconds (older than 10 s)
                 now = time.time()
-                for ts_int in list(self.pending.keys()):
-                    if now - ts_int > 10:
-                        del self.pending[ts_int]
+                stale = [ts for ts in list(self.pending.keys()) if now - ts > 10]
+                for ts_int in stale:
+                    logger.warning(
+                        "Dropping stale incomplete second %d (only %d/%d channels arrived)",
+                        ts_int,
+                        len(self.pending[ts_int]),
+                        self.num_channels,
+                    )
+                    del self.pending[ts_int]
 
                 # 4. Clean sb cache (optional, can be commented out if not needed)
-                self.sb.clean_cache(5)
+                removed = self.sb.clean_cache(5)
+                if removed:
+                    logger.debug("Cache cleanup removed %d stale file(s)", removed)
+
+                # 5. Heartbeat
+                self._maybe_heartbeat()
 
                 elapsed = time.perf_counter() - loop_start
                 time.sleep(max(0, self.poll_interval - elapsed))
 
         except KeyboardInterrupt:
-            print("[main] Interrupted. Shutting down...")
+            logger.info("Interrupted by user (Ctrl+C). Shutting down...")
         finally:
             self.sb.shutdown()
-            print("[main] SignalBurner GPU resources released.")
-            # Cleanup leftover GPU processes (just in case)
+            logger.info("SignalBurner GPU resources released.")
             self._cleanup_gpu_processes()
+            logger.info(
+                "Final stats: uptime=%.0fs, seconds_processed=%d, minutes_saved=%d",
+                time.time() - self._start_time,
+                self._seconds_processed,
+                self._minutes_saved,
+            )
 
     def _cleanup_gpu_processes(self):
         """Kill any remaining Python processes that are still using the GPU.
@@ -360,8 +518,8 @@ class LiveProcessor:
                 timeout=5,
             )
             if result.returncode != 0:
-                print(
-                    "[cleanup] nvidia-smi not available or returned error, skipping GPU cleanup."
+                logger.debug(
+                    "nvidia-smi not available or returned an error, skipping GPU cleanup."
                 )
                 return
 
@@ -376,14 +534,16 @@ class LiveProcessor:
                 if "python" in name.lower():
                     try:
                         pid = int(pid_str)
-                        print(
-                            f"[cleanup] Killing leftover Python process on GPU: PID {pid} ({name})"
+                        logger.warning(
+                            "Killing leftover Python process on GPU: PID %d (%s)",
+                            pid,
+                            name,
                         )
                         os.kill(pid, signal.SIGKILL)
                     except (ValueError, ProcessLookupError) as e:
-                        print(f"[cleanup] Could not kill PID {pid_str}: {e}")
-        except Exception as e:
-            print(f"[cleanup] GPU process cleanup failed: {e}")
+                        logger.error("Could not kill PID %s: %s", pid_str, e)
+        except Exception:
+            logger.exception("GPU process cleanup failed")
 
 
 def main():
@@ -399,7 +559,29 @@ def main():
     )
     parser.add_argument("--poll", type=float, default=POLL_INTERVAL)
     parser.add_argument("--max-diff", type=float, default=MAX_TIME_DIFF)
+    parser.add_argument(
+        "--heartbeat-interval",
+        type=float,
+        default=HEARTBEAT_INTERVAL,
+        help="Seconds between 'still alive' status log lines (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--log-retention-days",
+        type=int,
+        default=LOG_RETENTION_DAYS,
+        help="How many rotated daily log files to keep (default: %(default)s)",
+    )
+    parser.add_argument(
+        "-v",
+        "--verbose",
+        action="store_true",
+        help="Show DEBUG-level messages on the console as well as in the log file",
+    )
     args = parser.parse_args()
+
+    setup_logging(
+        args.output, verbose=args.verbose, retention_days=args.log_retention_days
+    )
 
     processor = LiveProcessor(
         cha_roots=args.cha_roots,
@@ -411,6 +593,7 @@ def main():
         selected_freqs_hz=args.freqs,
         poll_interval=args.poll,
         max_time_diff=args.max_diff,
+        heartbeat_interval=args.heartbeat_interval,
     )
     processor.run()
 

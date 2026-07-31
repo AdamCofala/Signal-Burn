@@ -3,7 +3,7 @@
 Render spectrograms and coherence plots from minute HDF5 snapshots.
 
 Usage:
-    python3 render_spectrograms.py --input /path/to/minute_h5/ --output ./images/
+    python3 diagnosys_plot.py --input /path/to/minute_h5/ --output ./images/
 """
 
 import argparse
@@ -16,6 +16,24 @@ import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
 import matplotlib.ticker as ticker
 import numpy as np
+
+
+plt.rcParams.update(
+    {
+        "font.family": "serif",
+        "font.size": 11,
+        "axes.labelsize": 12,
+        "axes.titlesize": 13,
+        "axes.linewidth": 0.8,
+        "xtick.labelsize": 10,
+        "ytick.labelsize": 10,
+        "xtick.direction": "out",
+        "ytick.direction": "out",
+        "legend.fontsize": 10,
+        "figure.dpi": 100,
+        "savefig.bbox": "tight",
+    }
+)
 
 
 def find_h5_files(input_dir):
@@ -63,7 +81,7 @@ def load_data(files, fs=25e6, fft_size=262144):
 
 
 def build_freq_axis(fft_size, fs):
-    """Return frequency axis in MHz (after fftshift) – used only for extent."""
+    """Return frequency axis in MHz (after fftshift) - used only for extent."""
     freq = np.fft.fftshift(np.fft.fftfreq(fft_size, d=1 / fs))
     return freq / 1e6
 
@@ -78,6 +96,28 @@ def downsample_freq(arr, factor):
     return arr.reshape(arr.shape[:-1] + (new_len, factor)).mean(axis=-1)
 
 
+def add_date_top_axis(ax, timestamps):
+    """
+    Add a secondary x-axis on top of the plot showing the calendar date,
+    so the day is visible independently of the HH:MM time axis below.
+    """
+    dt_start = datetime.datetime.fromtimestamp(timestamps[0])
+    dt_end = datetime.datetime.fromtimestamp(timestamps[-1])
+
+    top_ax = ax.secondary_xaxis("top")
+    top_ax.xaxis.set_major_locator(mdates.DayLocator())
+    top_ax.xaxis.set_major_formatter(mdates.DateFormatter("%Y-%m-%d"))
+    top_ax.tick_params(axis="x", labelsize=10)
+
+    # If the whole plot spans a single day, still show that date once
+    # (DayLocator alone would place no ticks strictly inside a single day).
+    if dt_start.date() == dt_end.date():
+        top_ax.set_xticks([mdates.date2num(dt_start)])
+        top_ax.set_xticklabels([dt_start.strftime("%Y-%m-%d")])
+
+    return top_ax
+
+
 def plot_spectrogram(
     ax,
     data_linear,
@@ -88,7 +128,7 @@ def plot_spectrogram(
     title="",
     cmap="jet",
 ):
-    """Plot a 2D spectrogram (dB). Y-axis relabelled to 0–25 MHz."""
+    """Plot a 2D spectrogram (dB). Y-axis relabelled to 0-25 MHz."""
     data_db = 10 * np.log10(data_linear + 1e-12)
     vmin = np.percentile(data_db, vmin_perc)
     vmax = np.percentile(data_db, vmax_perc)
@@ -111,17 +151,23 @@ def plot_spectrogram(
         vmax=vmax,
         cmap=cmap,
     )
-    # Shift Y-axis labels by +12.5 MHz so the display reads 0–25 MHz
+    # Shift Y-axis labels by +12.5 MHz so the display reads 0-25 MHz,
+    # with clean, evenly-spaced ticks every 2.5 MHz (0, 2.5, 5, ..., 25).
+    ax.yaxis.set_major_locator(ticker.MultipleLocator(2.5))
     ax.yaxis.set_major_formatter(ticker.FuncFormatter(lambda x, pos: f"{x + 12.5:.1f}"))
     ax.xaxis.set_major_formatter(mdates.DateFormatter("%H:%M"))
     ax.set_xlabel("Time [HH:MM]")
     ax.set_ylabel("Frequency [MHz]")
     ax.set_title(title)
+    ax.grid(which="major", axis="both", linestyle=":", linewidth=0.4, alpha=0.4)
+
+    add_date_top_axis(ax, timestamps)
+
     return im
 
 
 def plot_coherence(ax, coh_data, timestamps, freq_axis_mhz, title=""):
-    """Plot coherence (0-1). Y-axis relabelled to 0–25 MHz."""
+    """Plot coherence (0-1). Y-axis relabelled to 0-25 MHz."""
     dt = [datetime.datetime.fromtimestamp(ts) for ts in timestamps]
     extent = [
         mdates.date2num(dt[0]),
@@ -139,11 +185,16 @@ def plot_coherence(ax, coh_data, timestamps, freq_axis_mhz, title=""):
         vmax=1,
         cmap="plasma",
     )
+    ax.yaxis.set_major_locator(ticker.MultipleLocator(2.5))
     ax.yaxis.set_major_formatter(ticker.FuncFormatter(lambda x, pos: f"{x + 12.5:.1f}"))
     ax.xaxis.set_major_formatter(mdates.DateFormatter("%H:%M"))
     ax.set_xlabel("Time [HH:MM]")
     ax.set_ylabel("Frequency [MHz]")
     ax.set_title(title)
+    ax.grid(which="major", axis="both", linestyle=":", linewidth=0.4, alpha=0.4)
+
+    add_date_top_axis(ax, timestamps)
+
     return im
 
 

@@ -106,7 +106,7 @@ class Worker(QThread):
             fft_size=self.fft_size,
             dataset_name=self.dataset_name,
             cache_path=self.cache_dir,
-            use_cache=False,
+            use_cache=True,
             show_logs=True,
         )
         print("[Worker] SignalBurner ready.")
