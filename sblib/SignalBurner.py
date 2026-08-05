@@ -115,6 +115,17 @@ class SignalBurner:
             ]
             lib.sb_process_baseband_iq_full.restype = ctypes.c_int
 
+            lib.sb_process_baseband_iq_windowed.argtypes = [
+                ctypes.POINTER(ctypes.c_int16),
+                ctypes.c_size_t,
+                ctypes.c_float,
+                ctypes.c_int,
+                ctypes.c_int,
+                ctypes.POINTER(ctypes.c_float),
+                ctypes.POINTER(ctypes.c_float),
+            ]
+            lib.sb_process_baseband_iq_windowed.restype = ctypes.c_int
+
             if hasattr(lib, "sb_shutdown"):
                 lib.sb_shutdown.argtypes = []
                 lib.sb_shutdown.restype = None
@@ -392,6 +403,41 @@ class SignalBurner:
         if ret != 0:
             raise RuntimeError(f"sb_process_baseband_iq_full failed (code {ret})")
         return complex(real.value, imag.value)
+
+    def process_baseband_iq_windowed(
+        self,
+        h5_path: Path,
+        target_freq_hz: float = 0.0,
+        fs: float = 25e6,
+        window_size: int = 2500,
+        hop_size: int = 2500,
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """Zwraca tablice (real, imag) uśrednionych fazorów per okno."""
+        data, num_samples = self.load_iq_data(h5_path)
+        phase_inc = -2.0 * np.pi * target_freq_hz / fs
+
+        if num_samples < window_size:
+            return np.array([], dtype=np.float32), np.array([], dtype=np.float32)
+
+        num_windows = (num_samples - window_size) // hop_size + 1
+        out_real = np.empty(num_windows, dtype=np.float32)
+        out_imag = np.empty(num_windows, dtype=np.float32)
+
+        ret = self._lib.sb_process_baseband_iq_windowed(
+            data.ctypes.data_as(ctypes.POINTER(ctypes.c_int16)),
+            ctypes.c_size_t(num_samples),
+            ctypes.c_float(phase_inc),
+            ctypes.c_int(window_size),
+            ctypes.c_int(hop_size),
+            out_real.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+            out_imag.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+        )
+        if ret < 0:
+            raise RuntimeError(f"sb_process_baseband_iq_windowed failed (code {ret})")
+        if ret != num_windows:
+            out_real = out_real[:ret]
+            out_imag = out_imag[:ret]
+        return out_real, out_imag
 
     def process_fft_files(self, folder: Path) -> List[Tuple[Path, np.ndarray]]:
         folder = Path(folder)

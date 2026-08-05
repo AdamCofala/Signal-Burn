@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """
-Real-time I/Q processor – now with optional fast phase sampling for e‑czas.
+Real-time I/Q processor - unified high-rate phase sampling (500 Hz) with
+adaptive modulation threshold (histogram valley) and online oscillator-drift
+subtraction.
 """
 
 import argparse
@@ -16,8 +18,9 @@ from collections import defaultdict, deque
 from pathlib import Path
 import os
 
-
 import numpy as np
+from scipy.ndimage import gaussian_filter1d
+from scipy.signal import find_peaks
 
 from sblib.SignalBurner import SignalBurner
 
@@ -38,8 +41,14 @@ MAX_TIME_DIFF = 0.0
 HEARTBEAT_INTERVAL = 30.0
 LOG_RETENTION_DAYS = 14
 TARGET_FREQ_HZ = 12_500_000 - 225_000  # = 12_275_000 Hz
-PHASE_OFFSET_DEG = 36.0  # e‑czas phase shift
-FAST_SAMPLING_HZ = 50.0  # 50 Hz = 50 samples per second
+PHASE_OFFSET_DEG = 36.0
+PHASE_SAMPLING_HZ = 500.0
+DETREND_WINDOW_SEC = 300.0
+DETREND_REFIT_INTERVAL_SEC = 1.0
+WINDOW_SIZE = 2500
+HOP_SIZE = 2500
+HISTOGRAM_BINS = 60
+HISTOGRAM_SMOOTH_SIGMA = 1.5
 # ----------------------------------
 
 
@@ -99,6 +108,56 @@ def is_temp_file(fp: Path) -> bool:
     return fp.name.startswith("tmp.")
 
 
+class PhaseDetrender:
+    """Per-channel online phase unwrap + rolling-window linear-drift removal."""
+
+    def __init__(self, sampling_hz, window_sec, refit_interval_sec):
+        buffer_len = max(2, int(sampling_hz * window_sec))
+        self._buffer_t = deque(maxlen=buffer_len)
+        self._buffer_phase = deque(maxlen=buffer_len)
+        self._last_unwrapped_deg = None
+        self._refit_interval_sec = refit_interval_sec
+        self._last_refit_t = None
+        self._slope_deg_per_sec = 0.0
+        self._intercept_deg = 0.0
+        self._fit_t0 = None
+
+    def update(self, t_sec, wrapped_deg):
+        if self._last_unwrapped_deg is None:
+            unwrapped = wrapped_deg
+        else:
+            last_wrapped = ((self._last_unwrapped_deg + 180) % 360) - 180
+            delta = wrapped_deg - last_wrapped
+            if delta > 180:
+                delta -= 360
+            elif delta < -180:
+                delta += 360
+            unwrapped = self._last_unwrapped_deg + delta
+        self._last_unwrapped_deg = unwrapped
+
+        self._buffer_t.append(t_sec)
+        self._buffer_phase.append(unwrapped)
+
+        if self._last_refit_t is None or (t_sec - self._last_refit_t) >= self._refit_interval_sec:
+            if len(self._buffer_t) >= 2:
+                t_arr = np.asarray(self._buffer_t, dtype=np.float64)
+                p_arr = np.asarray(self._buffer_phase, dtype=np.float64)
+                t0 = t_arr[0]
+                slope, intercept = np.polyfit(t_arr - t0, p_arr, 1)
+                self._slope_deg_per_sec = slope
+                self._intercept_deg = intercept
+                self._fit_t0 = t0
+            self._last_refit_t = t_sec
+
+        if self._fit_t0 is None:
+            trend = 0.0
+        else:
+            trend = self._slope_deg_per_sec * (t_sec - self._fit_t0) + self._intercept_deg
+
+        residual = unwrapped - trend
+        return residual, self._slope_deg_per_sec
+
+
 class LiveProcessor:
     def __init__(
         self,
@@ -113,7 +172,13 @@ class LiveProcessor:
         max_time_diff,
         target_freq_hz,
         phase_offset_deg=0.0,
-        fast_sampling_hz=0.0,
+        phase_sampling_hz=0.0,
+        detrend_window_sec=DETREND_WINDOW_SEC,
+        detrend_refit_interval_sec=DETREND_REFIT_INTERVAL_SEC,
+        window_size=WINDOW_SIZE,
+        hop_size=HOP_SIZE,
+        histogram_bins=HISTOGRAM_BINS,
+        histogram_smooth_sigma=HISTOGRAM_SMOOTH_SIGMA,
         heartbeat_interval=30,
     ):
         self.cha_roots = [Path(p) for p in cha_roots]
@@ -126,14 +191,15 @@ class LiveProcessor:
         self.max_time_diff = max_time_diff
         self.target_freq_hz = target_freq_hz
         self.phase_offset_rad = np.radians(phase_offset_deg)
-        self.fast_sampling_hz = fast_sampling_hz
+        self.phase_sampling_hz = phase_sampling_hz
+        self.window_size = window_size
+        self.hop_size = hop_size
+        self.histogram_bins = histogram_bins
+        self.histogram_smooth_sigma = histogram_smooth_sigma
         self.heartbeat_interval = heartbeat_interval
 
         self.second_log_path = self.output_dir / "second_fft.csv"
         self.phase_log_path = self.output_dir / "phase.csv"
-        self.phase_fast_log_path = (
-            self.output_dir / "phase_fast.csv" if fast_sampling_hz > 0 else None
-        )
         self.minute_h5_dir = self.output_dir / "minute_h5"
         self.minute_h5_dir.mkdir(parents=True, exist_ok=True)
 
@@ -158,9 +224,7 @@ class LiveProcessor:
         )
 
         self.seen = [dict() for _ in range(self.num_channels)]
-        ignored_counts = []
-        for ch in range(self.num_channels):
-            ignored_counts.append(self._ignore_existing_files(ch))
+        ignored_counts = [self._ignore_existing_files(ch) for ch in range(self.num_channels)]
         logger.info(
             "Startup scan complete - ignored existing files per channel: %s (total=%d)",
             ", ".join(f"cha{ch + 1}={n}" for ch, n in enumerate(ignored_counts)),
@@ -179,10 +243,15 @@ class LiveProcessor:
         self._fft_times_rolling = deque(maxlen=59)
         self._phase_times_rolling = deque(maxlen=59)
 
-        # For fast phase sampling
-        if self.fast_sampling_hz > 0:
-            self._fast_period = 1.0 / self.fast_sampling_hz
-            self._last_fast_sample_time = 0.0
+        if self.phase_sampling_hz > 0:
+            self._detrenders = [
+                PhaseDetrender(
+                    sampling_hz=self.phase_sampling_hz,
+                    window_sec=detrend_window_sec,
+                    refit_interval_sec=detrend_refit_interval_sec,
+                )
+                for _ in range(self.num_channels)
+            ]
 
     def _ignore_existing_files(self, channel_idx: int) -> int:
         root = self.cha_roots[channel_idx]
@@ -246,7 +315,6 @@ class LiveProcessor:
         need_coh = ts_int % 60 == 0
 
         try:
-            # 1. Power spectra
             if not need_coh:
                 ffts = {}
                 fft_time_sum = 0.0
@@ -268,28 +336,13 @@ class LiveProcessor:
 
             self._write_second_log(ts_int, [ffts[i] for i in range(self.num_channels)])
 
-            # 2. Complex phasor (full‑second average) + phase offset
-            phase_start = time.perf_counter()
-            reals, imags = [], []
-            for ch, fp in enumerate(files):
-                z = self.sb.process_baseband_iq(
-                    fp, target_freq_hz=self.target_freq_hz, fs=self.fs
-                )
-                # Apply 36° phase shift: multiply by e^(j * offset)
-                z_shifted = z * np.exp(1j * self.phase_offset_rad)
-                reals.append(z_shifted.real)
-                imags.append(z_shifted.imag)
-            phase_time = time.perf_counter() - phase_start
-            self._write_phase_log(ts_int, reals, imags)
+            if self.phase_sampling_hz > 0:
+                phase_start = time.perf_counter()
+                self._phase_sample(files, timestamps)
+                phase_time = time.perf_counter() - phase_start
+                if not need_coh:
+                    self._phase_times_rolling.append(phase_time)
 
-            if not need_coh:
-                self._phase_times_rolling.append(phase_time)
-
-            # 3. Fast phase sampling (for e‑czas 50 Hz analysis)
-            if self.fast_sampling_hz > 0:
-                self._fast_phase_sample(files, timestamps)
-
-            # 4. Minute snapshot
             if need_coh:
                 total_time = time.perf_counter() - total_start
                 self._save_minute_snapshot(
@@ -310,32 +363,135 @@ class LiveProcessor:
             self._errors_since_heartbeat += 1
             return False
 
-    def _fast_phase_sample(self, files, timestamps):
-        """Take a fast phase sample for e‑czas analysis."""
-        now = time.time()
-        if now - self._last_fast_sample_time < self._fast_period:
-            return
-        self._last_fast_sample_time = now
+    def _find_valley_threshold(self, amplitudes: np.ndarray) -> float:
+        """Adaptacyjny próg z histogramu, ale z fallbackiem do percentyla,
+        gdy modulacja jest niewyraźna lub dane zbyt jednorodne."""
+        if len(amplitudes) < 2:
+            return 0.0
 
-        # Use a shorter window for fast sampling (10 ms = 250k samples at 25 MHz)
-        fast_window_size = int(self.fs * 0.01)  # 10 ms
-        if fast_window_size > self.fft_size:
-            fast_window_size = self.fft_size
+        hist, bin_edges = np.histogram(amplitudes, bins=self.histogram_bins)
+        bin_centers = (bin_edges[:-1] + bin_edges[1:]) / 2
 
-        row = [int(timestamps[0] * 1000)]  # timestamp in ms
+        if self.histogram_smooth_sigma > 0:
+            hist_smooth = gaussian_filter1d(hist.astype(float), sigma=self.histogram_smooth_sigma)
+        else:
+            hist_smooth = hist.astype(float)
+
+        # Znajdź piki (lokalne maksima) z minimalną wysokością
+        peaks, props = find_peaks(hist_smooth, height=max(1, hist_smooth.max() * 0.05))
+        if len(peaks) < 2:
+            # Nie ma dwóch pików → fallback do percentyla
+            return np.percentile(amplitudes, 20)
+
+        # Zachowaj tylko dwa najwyższe piki
+        if len(peaks) > 2:
+            peak_heights = hist_smooth[peaks]
+            top_idx = np.argsort(peak_heights)[-2:]
+            peaks = peaks[top_idx]
+
+        # Posortuj według położenia na osi X (amplitudy)
+        sorted_idx = np.argsort(bin_centers[peaks])
+        peak1_idx = peaks[sorted_idx[0]]
+        peak2_idx = peaks[sorted_idx[1]]
+
+        # Sprawdź, czy piki są wystarczająco odseparowane amplitudowo
+        # (jeśli nie, to znaczy, że modulacja jest płytka lub jej brak)
+        if (bin_centers[peak2_idx] - bin_centers[peak1_idx]) < 0.2 * np.std(amplitudes):
+            return np.percentile(amplitudes, 20)
+
+        # Znajdź dolinę między pikami
+        if peak2_idx > peak1_idx:
+            valley_slice = hist_smooth[peak1_idx:peak2_idx + 1]
+            valley_idx = np.argmin(valley_slice) + peak1_idx
+            threshold = bin_centers[valley_idx]
+        else:
+            threshold = (bin_centers[peak1_idx] + bin_centers[peak2_idx]) / 2.0
+
+        # Ostateczna kontrola – próg nie może być zbyt wysoki ani zbyt niski
+        if threshold < np.percentile(amplitudes, 5) or threshold > np.percentile(amplitudes, 50):
+            threshold = np.percentile(amplitudes, 20)
+
+        return threshold
+
+    def _phase_sample(self, files, timestamps):
+        """Szybkie próbkowanie fazy 500 Hz z wektoryzacją NumPy."""
+        tick_rate = self.phase_sampling_hz
+        all_real = []
+        all_imag = []
+
+        # 1. Pobranie wszystkich okien z GPU (każdy kanał)
         for ch, fp in enumerate(files):
-            data, _ = self.sb.load_iq_data(fp)
-            window = data[: fast_window_size * 2]
-            phase_inc = -2.0 * np.pi * self.target_freq_hz / self.fs
-            z = self.sb.process_baseband_iq(
-                fp, target_freq_hz=self.target_freq_hz, fs=self.fs
+            real, imag = self.sb.process_baseband_iq_windowed(
+                fp,
+                target_freq_hz=self.target_freq_hz,
+                fs=self.fs,
+                window_size=self.window_size,
+                hop_size=self.hop_size,
             )
-            z_shifted = z * np.exp(1j * self.phase_offset_rad)
-            row.append(np.degrees(np.angle(z_shifted)))
-            row.append(abs(z_shifted))
+            if len(real) == 0:
+                logger.warning("Kanał %d: brak okien, pomijam fazę", ch + 1)
+                return
+            all_real.append(real)
+            all_imag.append(imag)
 
-        write_header = not self.phase_fast_log_path.exists()
-        with open(self.phase_fast_log_path, "a", newline="") as f:
+        # 2. Czasy rozpoczęcia każdego okna (w sekundach względem początku pliku)
+        num_windows = len(all_real[0])
+        win_start_times = np.arange(num_windows) * (self.hop_size / self.fs)
+        base_time = timestamps[0]
+        tick_interval = 1.0 / tick_rate
+
+        # 3. Przypisanie każdego okna do numeru ticka (indeks 0..max_tick-1)
+        tick_indices = np.floor(win_start_times / tick_interval).astype(np.int32)
+        max_tick = tick_indices[-1] + 1  # liczba ticków
+
+        # 4. Dla każdego kanału wyznaczamy średni fazor per tick z selekcją
+        channel_tick_phase = []  # lista tablic: [ch][tick] -> (phase_residual, amplitude)
+        for ch in range(self.num_channels):
+            real_arr = all_real[ch]
+            imag_arr = all_imag[ch]
+            amps = np.sqrt(real_arr**2 + imag_arr**2)
+            # fazory zespolone
+            z_arr = real_arr + 1j * imag_arr
+
+            # tablice wynikowe per tick
+            phase_vals = np.full(max_tick, np.nan)
+            amp_vals = np.full(max_tick, np.nan)
+
+            for tick in range(max_tick):
+                mask = (tick_indices == tick)
+                if not np.any(mask):
+                    continue
+
+                tick_amps = amps[mask]
+                tick_z = z_arr[mask]
+
+                # Adaptacyjny próg (dolina histogramu)
+                threshold = self._find_valley_threshold(tick_amps)  # ta funkcja może być ta sama
+                selected = tick_amps <= threshold
+                if not np.any(selected):
+                    # fallback: 10% najcichszych
+                    n_select = max(1, len(tick_amps) // 10)
+                    idx_sorted = np.argsort(tick_amps)[:n_select]
+                    selected = np.zeros(len(tick_amps), dtype=bool)
+                    selected[idx_sorted] = True
+
+                avg_z = np.mean(tick_z[selected])
+                avg_z_shifted = avg_z * np.exp(1j * self.phase_offset_rad)
+
+                phase_vals[tick] = np.degrees(np.angle(avg_z_shifted))
+                amp_vals[tick] = np.abs(avg_z_shifted)
+
+            channel_tick_phase.append((phase_vals, amp_vals))
+
+        # 5. Detrender i zapis do CSV – tylko dla ticków z danymi ze wszystkich kanałów
+        valid_ticks = ~np.isnan(channel_tick_phase[0][0])  # maska gdzie są dane z kanału 0
+        for ch in range(1, self.num_channels):
+            valid_ticks &= ~np.isnan(channel_tick_phase[ch][0])
+
+        tick_times = base_time + np.where(valid_ticks)[0] * tick_interval + tick_interval / 2
+
+        write_header = not self.phase_log_path.exists()
+        with open(self.phase_log_path, "a", newline="") as f:
             writer = csv.writer(f)
             if write_header:
                 header = ["timestamp_ms"]
@@ -343,7 +499,16 @@ class LiveProcessor:
                     header.append(f"cha{ch}_phase_deg")
                     header.append(f"cha{ch}_amplitude")
                 writer.writerow(header)
-            writer.writerow(row)
+
+            for idx, t_sec in enumerate(tick_times):
+                row = [int(t_sec * 1000)]
+                for ch in range(self.num_channels):
+                    phase_val = channel_tick_phase[ch][0][valid_ticks][idx]
+                    amp_val = channel_tick_phase[ch][1][valid_ticks][idx]
+                    residual, _ = self._detrenders[ch].update(t_sec, phase_val)
+                    row.append(residual)
+                    row.append(amp_val)
+                writer.writerow(row)
 
     def _write_second_log(self, ts_int, ffts):
         row = [ts_int]
@@ -358,22 +523,6 @@ class LiveProcessor:
                 for ch in range(1, self.num_channels + 1):
                     for f_hz in SELECTED_FREQUENCIES_HZ:
                         h.append(f"cha{ch}_{f_hz / 1e6:.2f}MHz")
-                w.writerow(h)
-            w.writerow(row)
-
-    def _write_phase_log(self, ts_int, reals, imags):
-        row = [ts_int]
-        for ch in range(self.num_channels):
-            row.append(reals[ch])
-            row.append(imags[ch])
-        write_header = not self.phase_log_path.exists()
-        with open(self.phase_log_path, "a", newline="") as f:
-            w = csv.writer(f)
-            if write_header:
-                h = ["second"]
-                for ch in range(1, self.num_channels + 1):
-                    h.append(f"cha{ch}_real")
-                    h.append(f"cha{ch}_imag")
                 w.writerow(h)
             w.writerow(row)
 
@@ -409,8 +558,8 @@ class LiveProcessor:
         )
         logger.info(
             f"Minute {minute_start} snapshot -> {h5_path} ({save_time:.4f}s save)\n"
-            f"    Triple‑all: {triple_time:.4f}s\n"
-            f"    Phase (complex avg): {phase_time:.6f}s\n"
+            f"    Triple-all: {triple_time:.4f}s\n"
+            f"    Phase sample (detrend): {phase_time:.6f}s\n"
             f"    Avg FFT/sec: {avg_fft:.4f}s\n"
             f"    Avg phase/sec: {avg_phase:.6f}s\n"
             f"    Total second: {total_time:.4f}s"
@@ -479,24 +628,18 @@ def main():
     parser.add_argument("--cache", type=Path, default=CACHE_DIR)
     parser.add_argument("--dataset", default=DATASET_NAME)
     parser.add_argument("--output", type=Path, default=OUTPUT_DIR)
-    parser.add_argument(
-        "--freqs", nargs="+", type=float, default=SELECTED_FREQUENCIES_HZ
-    )
+    parser.add_argument("--freqs", nargs="+", type=float, default=SELECTED_FREQUENCIES_HZ)
     parser.add_argument("--poll", type=float, default=POLL_INTERVAL)
     parser.add_argument("--max-diff", type=float, default=MAX_TIME_DIFF)
     parser.add_argument("--target-freq-hz", type=float, default=TARGET_FREQ_HZ)
-    parser.add_argument(
-        "--phase-offset-deg",
-        type=float,
-        default=PHASE_OFFSET_DEG,
-        help="Phase offset for e‑czas (default: 36°)",
-    )
-    parser.add_argument(
-        "--fast-sampling-hz",
-        type=float,
-        default=FAST_SAMPLING_HZ,
-        help="Fast phase sampling rate (Hz, 0=off)",
-    )
+    parser.add_argument("--phase-offset-deg", type=float, default=PHASE_OFFSET_DEG)
+    parser.add_argument("--phase-sampling-hz", type=float, default=PHASE_SAMPLING_HZ)
+    parser.add_argument("--detrend-window-sec", type=float, default=DETREND_WINDOW_SEC)
+    parser.add_argument("--detrend-refit-interval-sec", type=float, default=DETREND_REFIT_INTERVAL_SEC)
+    parser.add_argument("--window-size", type=int, default=WINDOW_SIZE, help="Rozmiar okna (próbki)")
+    parser.add_argument("--hop-size", type=int, default=HOP_SIZE, help="Skok okna (próbki)")
+    parser.add_argument("--histogram-bins", type=int, default=HISTOGRAM_BINS, help="Liczba binów histogramu")
+    parser.add_argument("--histogram-smooth-sigma", type=float, default=HISTOGRAM_SMOOTH_SIGMA, help="Wygładzenie histogramu (sigma)")
     parser.add_argument("-v", "--verbose", action="store_true")
     args = parser.parse_args()
     setup_logging(args.output, args.verbose, LOG_RETENTION_DAYS)
@@ -512,7 +655,13 @@ def main():
         max_time_diff=args.max_diff,
         target_freq_hz=args.target_freq_hz,
         phase_offset_deg=args.phase_offset_deg,
-        fast_sampling_hz=args.fast_sampling_hz,
+        phase_sampling_hz=args.phase_sampling_hz,
+        detrend_window_sec=args.detrend_window_sec,
+        detrend_refit_interval_sec=args.detrend_refit_interval_sec,
+        window_size=args.window_size,
+        hop_size=args.hop_size,
+        histogram_bins=args.histogram_bins,
+        histogram_smooth_sigma=args.histogram_smooth_sigma,
     )
     proc.run()
 

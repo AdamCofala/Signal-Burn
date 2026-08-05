@@ -164,6 +164,61 @@ __global__ void complexAvgStream(const IQSample* in, float* real_sum, float* ima
     }
 }
 
+// ---- NOWY KERNEL: uśredniony fazor per okno ----
+__global__ void complexAvgWindowedKernel(
+    const IQSample* in, float* real_out, float* imag_out,
+    float phase_inc, int window_size, int hop_size,
+    int num_windows, int total_samples)
+{
+    int wid = blockIdx.x;
+    if (wid >= num_windows) return;
+
+    int start = wid * hop_size;
+    extern __shared__ float sdata[];
+    float* s_real = sdata;
+    float* s_imag = sdata + blockDim.x;
+
+    int tid = threadIdx.x;
+    float sum_r = 0.0f, sum_i = 0.0f;
+
+    for (int i = start + tid; i < start + window_size && i < total_samples; i += blockDim.x) {
+        float r = (float)in[i].r;
+        float im = (float)in[i].i;
+        if (phase_inc != 0.0f) {
+            float angle = phase_inc * (float)i;
+            float s, c;
+            sincosf(angle, &s, &c);
+            float new_r = r * c - im * s;
+            float new_i = r * s + im * c;
+            r = new_r;
+            im = new_i;
+        }
+        int local_idx = i - start;
+        float w = 0.5f * (1.0f - cosf(2.0f * (float)M_PI * local_idx / (window_size - 1)));
+        r *= w;
+        im *= w;
+        sum_r += r;
+        sum_i += im;
+    }
+
+    s_real[tid] = sum_r;
+    s_imag[tid] = sum_i;
+    __syncthreads();
+
+    for (unsigned int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            s_real[tid] += s_real[tid + s];
+            s_imag[tid] += s_imag[tid + s];
+        }
+        __syncthreads();
+    }
+
+    if (tid == 0) {
+        float inv = 1.0f / (float)window_size;
+        real_out[wid] = s_real[0] * inv;
+        imag_out[wid] = s_imag[0] * inv;
+    }
+}
 
 // ---------------------------------------------------------------------
 //  Global state & plans
@@ -202,6 +257,10 @@ static size_t          g_allocated_in3_size = 0;
 static float*          g_real_sum = nullptr;
 static float*          g_imag_sum = nullptr;
 
+static float*          g_d_window_real   = nullptr;
+static float*          g_d_window_imag   = nullptr;
+static int             g_allocated_windows = 0;
+
 static cufftHandle get_plan(int n) {
     auto it = g_plans.find(n);
     if (it != g_plans.end()) return it->second;
@@ -210,7 +269,6 @@ static cufftHandle get_plan(int n) {
     g_plans[n] = plan;
     return plan;
 }
-
 
 // ---------------------------------------------------------------------
 //  Reallocation helpers
@@ -281,6 +339,14 @@ void reallocate_input3(size_t num_samples) {
     g_allocated_in3_size = num_samples;
 }
 
+void reallocate_window_buffers(int num_windows) {
+    if (num_windows <= g_allocated_windows) return;
+    if (g_d_window_real) cudaFree(g_d_window_real);
+    if (g_d_window_imag) cudaFree(g_d_window_imag);
+    cudaMalloc(&g_d_window_real, num_windows * sizeof(float));
+    cudaMalloc(&g_d_window_imag, num_windows * sizeof(float));
+    g_allocated_windows = num_windows;
+}
 
 // ---------------------------------------------------------------------
 //  Shared window processing helper
@@ -303,7 +369,6 @@ static void process_single_window(const IQSample* d_input, int offset,
         cudaMemcpy(d_fft_save, d_fft, fft_size * sizeof(cufftComplex), cudaMemcpyDeviceToDevice);
     }
 }
-
 
 // ---------------------------------------------------------------------
 //  API functions
@@ -628,6 +693,34 @@ int sb_process_baseband_iq_full(const int16_t* interleaved_iq, size_t num_sample
     return 0;
 }
 
+int sb_process_baseband_iq_windowed(
+    const int16_t* interleaved_iq, size_t num_samples,
+    float phase_inc, int window_size, int hop_size,
+    float* out_real, float* out_imag)
+{
+    if (num_samples < (size_t)window_size) return -1;
+    std::lock_guard<std::mutex> lock(g_state_mutex);
+
+    if (num_samples > g_allocated_in_size) reallocate_input(num_samples);
+    cudaMemcpy(g_d_in, interleaved_iq, num_samples * sizeof(IQSample), cudaMemcpyHostToDevice);
+
+    int num_windows = (int)((num_samples - window_size) / hop_size + 1);
+    if (num_windows <= 0) return -2;
+
+    reallocate_window_buffers(num_windows);
+
+    int threads = 256;
+    size_t smem = 2 * threads * sizeof(float);
+    complexAvgWindowedKernel<<<num_windows, threads, smem>>>(
+        g_d_in, g_d_window_real, g_d_window_imag, phase_inc,
+        window_size, hop_size, num_windows, (int)num_samples);
+    cudaDeviceSynchronize();
+
+    cudaMemcpy(out_real, g_d_window_real, num_windows * sizeof(float), cudaMemcpyDeviceToHost);
+    cudaMemcpy(out_imag, g_d_window_imag, num_windows * sizeof(float), cudaMemcpyDeviceToHost);
+    return num_windows;
+}
+
 void sb_shutdown() {
     std::lock_guard<std::mutex> lock(g_state_mutex);
     for (auto& kv : g_plans) cufftDestroy(kv.second);
@@ -652,6 +745,8 @@ void sb_shutdown() {
     if (g_d_pow3)          { cudaFree(g_d_pow3);          g_d_pow3 = nullptr; }
     if (g_real_sum)        { cudaFree(g_real_sum);        g_real_sum = nullptr; }
     if (g_imag_sum)        { cudaFree(g_imag_sum);        g_imag_sum = nullptr; }
+    if (g_d_window_real)   { cudaFree(g_d_window_real);   g_d_window_real = nullptr; }
+    if (g_d_window_imag)   { cudaFree(g_d_window_imag);   g_d_window_imag = nullptr; }
 
     g_allocated_n = 0;
     g_allocated_in_size = 0;
@@ -660,6 +755,7 @@ void sb_shutdown() {
     g_allocated_coh_n = 0;
     g_allocated_n_triple = 0;
     g_allocated_in3_size = 0;
+    g_allocated_windows = 0;
 }
 
 } // extern "C"
