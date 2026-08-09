@@ -29,9 +29,9 @@ import matplotlib.dates as mdates
 import matplotlib.ticker as ticker
 import numpy as np
 import h5py
-from scipy.signal import butter, filtfilt  # <-- dodane do filtracji
+from scipy.signal import butter, filtfilt
 
-# ---------- defaults ----------
+# Default settings
 DEFAULT_INPUT_DIR = Path("/pool/signal_storage/output/minute_h5")
 DEFAULT_OUTPUT_DIR = Path("./images")
 DEFAULT_FS = 25_000_000
@@ -44,9 +44,8 @@ DEFAULT_VMAX = 95
 DEFAULT_DPI = 300
 CLEAN_WINDOW_SEC = 60.0  # default rolling window for clean phase averaging
 CLEAN_PERCENTILE = 5.0  # lowest amplitude percentile to keep
-DEFAULT_FILTER_CUTOFF = 0.007  # Hz, domyślna częstotliwość graniczna LP
+DEFAULT_FILTER_CUTOFF = 0.007  # Hz, default low-pass cutoff
 DEFAULT_FILTER_ORDER = 4
-# ------------------------------
 
 # All timestamps in the HDF5/CSV files are UNIX time. Every plot is rendered
 # in Poland local time, regardless of the timezone configured on the machine
@@ -72,7 +71,7 @@ plt.rcParams.update(
 
 
 def butter_lowpass(cutoff, fs, order=4):
-    """Projektuje cyfrowy filtr Butterwortha dolnoprzepustowy."""
+    """Design a digital Butterworth low-pass filter."""
     nyq = 0.5 * fs
     normal_cutoff = cutoff / nyq
     b, a = butter(order, normal_cutoff, btype="low", analog=False)
@@ -80,7 +79,7 @@ def butter_lowpass(cutoff, fs, order=4):
 
 
 def lowpass_filter(data, cutoff, fs, order=4):
-    """Filtruje sygnał filtrem dolnoprzepustowym (bez przesunięcia fazowego)."""
+    """Apply a zero-phase low-pass filter to the input signal."""
     b, a = butter_lowpass(cutoff, fs, order)
     return filtfilt(b, a, data)
 
@@ -167,7 +166,7 @@ def build_time_locator(timestamps):
     elif span_sec <= 12 * 60 * 60:
         return mdates.MinuteLocator(byminute=[0, 30], tz=LOCAL_TZ)
     elif span_sec <= 24 * 60 * 60:
-        # Zmiana: znaczniki co 3 godziny zamiast co godzinę
+        # Use 3-hour ticks instead of hourly ticks for longer ranges.
         return mdates.HourLocator(byhour=range(0, 24, 3), tz=LOCAL_TZ)
     elif span_sec <= 3 * 24 * 60 * 60:
         return mdates.HourLocator(byhour=range(0, 24, 3), tz=LOCAL_TZ)
@@ -296,16 +295,13 @@ def plot_coherence(ax, coh_data, timestamps, freq_mhz, title=""):
     return im
 
 
-# ----------------------------------------------------------------------
-#  Modulation cleaning for phase (carrier-only samples)
-# ----------------------------------------------------------------------
+# Modulation cleaning for phase traces (carrier-only samples)
 def clean_phase_data(timestamps, phase, amplitude, window_sec=60.0, percentile=10.0):
     """
     Select samples with amplitude below the `percentile`-th value in each
     sliding window of length `window_sec`, then average their phase.
 
     Parameters
-    ----------
     timestamps : 1D array (seconds)
     phase : 1D array (degrees)
     amplitude : 1D array (positive)
@@ -313,9 +309,8 @@ def clean_phase_data(timestamps, phase, amplitude, window_sec=60.0, percentile=1
     percentile : float, 0..100
 
     Returns
-    -------
-    times_out : 1D array – window center times
-    phase_out : 1D array – average clean phase in window
+    times_out : 1D array with window center times
+    phase_out : 1D array with the averaged clean phase per window
     """
     t = np.asarray(timestamps, dtype=np.float64)
     p = np.asarray(phase, dtype=np.float64)
@@ -360,10 +355,11 @@ def plot_phases(
     filter_cutoff=DEFAULT_FILTER_CUTOFF,
     filter_order=DEFAULT_FILTER_ORDER,
 ):
-    """Read the unified phase.csv and plot phase per channel.
-    If clean=True, compute and plot carrier-only phase averaged in windows,
-    optionally applying a low-pass filter, and save both raw clean and
-    filtered clean CSVs.
+    """Read the unified phase CSV and plot the phase for each channel.
+
+    When clean=True, the function computes a carrier-only phase estimate by
+    averaging low-amplitude samples in sliding windows and optionally applies
+    a low-pass filter before saving both the raw and filtered clean CSVs.
     """
     if not phase_csv.exists():
         print(f"File {phase_csv} not found.")
@@ -409,7 +405,7 @@ def plot_phases(
             f"({len(timestamps_plot)}/{len(timestamps_unix)} points) to keep plotting fast."
         )
 
-    # ---- standard raw phase plot ----
+    # Standard raw phase plot
     for ch in range(1, num_channels + 1):
         phase_vals = np.array(data[ch]["phase"])[plot_idx]
 
@@ -431,11 +427,11 @@ def plot_phases(
         fig.savefig(output_dir / f"phase_cha{ch}.png", dpi=DEFAULT_DPI)
         plt.close(fig)
 
-    # ---- clean phase (carrier-only) ----
+    # Clean phase (carrier-only) processing
     if clean:
         print("Computing carrier-only clean phase...")
         clean_data = {}
-        # Częstotliwość próbkowania wyczyszczonego sygnału
+        # Sampling frequency of the cleaned phase signal
         fs_clean = 1.0 / clean_window_sec
 
         for ch in range(1, num_channels + 1):
@@ -449,7 +445,7 @@ def plot_phases(
                 window_sec=clean_window_sec,
                 percentile=clean_percentile,
             )
-            # Filtracja dolnoprzepustowa
+            # Low-pass filtering
             ph_clean_filtered = None
             if len(ph_clean) > 3 * filter_order:
                 ph_clean_filtered = lowpass_filter(
@@ -460,7 +456,9 @@ def plot_phases(
                     f"Channel {ch}: too few clean samples ({len(ph_clean)}) "
                     f"for filter order {filter_order}, skipping filter."
                 )
-                ph_clean_filtered = ph_clean  # pozostaw bez filtrowania
+                ph_clean_filtered = (
+                    ph_clean  # keep the original values when filtering is not possible
+                )
 
             clean_data[ch] = (t_clean, ph_clean, ph_clean_filtered)
 
@@ -468,8 +466,7 @@ def plot_phases(
                 print(f"Warning: no clean phase computed for channel {ch}.")
                 continue
 
-            # Rysowanie: surowy resztkowy (cienki, szary), czysty niefiltrowany (przerywany),
-            # czysty filtrowany (gruby zielony)
+            # Plot the raw residual together with the cleaned filtered trace.
             fig, ax = plt.subplots(figsize=(16, 9))
             # raw residual
             ax.plot(
@@ -514,7 +511,7 @@ def plot_phases(
             fig.savefig(output_dir / f"phase_cha{ch}_clean.png", dpi=DEFAULT_DPI)
             plt.close(fig)
 
-        # Zapis czystego niefiltrowanego (oryginalny clean)
+        # Save the unfiltered clean phase export
         clean_csv_path = output_dir / "phase_clean.csv"
         with open(clean_csv_path, "w", newline="") as f:
             writer = csv.writer(f)
@@ -541,7 +538,7 @@ def plot_phases(
                 writer.writerow(row)
         print(f"Unfiltered clean phase CSV saved to {clean_csv_path}")
 
-        # Zapis czystego po filtracji
+        # Save the filtered clean phase export
         filt_csv_path = output_dir / "phase_clean_filtered.csv"
         with open(filt_csv_path, "w", newline="") as f:
             writer = csv.writer(f)
@@ -549,7 +546,7 @@ def plot_phases(
             for ch in range(1, num_channels + 1):
                 header.append(f"cha{ch}_clean_filtered_phase_deg")
             writer.writerow(header)
-            # Używamy tych samych czasów okien (t_clean), ale filtrowane wartości
+            # Use the same window timestamps while writing the filtered values
             all_times = set()
             for ch in range(1, num_channels + 1):
                 all_times.update(clean_data[ch][0])

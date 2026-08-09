@@ -1,4 +1,4 @@
-"""GPU-accelerated I/Q HDF5 processing library (SignalBurner)."""
+"""GPU-accelerated I/Q HDF5 processing library for SignalBurner."""
 
 import ctypes
 import hashlib
@@ -228,7 +228,7 @@ class SignalBurner:
         mtime_c = cache_file.stat().st_mtime
         return mtime_c >= os.path.getmtime(p1) and mtime_c >= os.path.getmtime(p2)
 
-    # --- public methods ---
+    # Public methods
     def process_file(self, h5_path: Path) -> np.ndarray:
         if self.use_cache:
             cache_file = self.get_cache_file(h5_path)

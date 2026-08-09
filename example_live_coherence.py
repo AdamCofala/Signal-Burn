@@ -21,9 +21,7 @@ from PyQt5.QtWidgets import QApplication, QMainWindow, QVBoxLayout, QWidget
 
 from sblib.SignalBurner import SignalBurner
 
-# ----------------------------------------------------------------------
-# defaults
-# ----------------------------------------------------------------------
+# Default configuration
 CHA1_ROOT = Path("/dev/shm/signal-burn/hf25/cha1")
 CHA2_ROOT = Path("/dev/shm/signal-burn/hf25/cha2")
 CACHE_DIR = Path("/pool/signal_storage/cache")
@@ -36,7 +34,6 @@ CLEAR_INPUT_FOLDER = True
 DOWNSAMPLE_DISPLAY = 1  # keep every N‑th file in time
 FREQ_DOWNSAMPLE = 128  # downsampling factor on frequency axis
 X_FUTURE = 5.0  # extend x‑axis into the future (seconds)
-# ----------------------------------------------------------------------
 
 
 def latest_input_dir(base: Path) -> Path:
@@ -88,7 +85,7 @@ class Worker(QThread):
         self.hist_coh = deque()
 
     def run(self):
-        # TWORZYMY SignalBurner dokładnie jak w działającym kodzie
+        # Create the SignalBurner instance using the same configuration as the working pipeline.
         self.sb = SignalBurner(
             fft_size=self.fft_size,
             dataset_name=self.dataset_name,
@@ -185,7 +182,7 @@ class Worker(QThread):
 
             t_start = time.time()
             try:
-                # JEDYNIE LICZYMY KOHERENCJĘ
+                # Compute coherence only.
                 coh = self.sb.process_coherence(p1, p2)
                 dt = time.time() - t_start
                 processing_times.append(dt)

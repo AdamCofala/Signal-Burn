@@ -10,14 +10,13 @@ import numpy as np
 from pathlib import Path
 from sblib.SignalBurner import SignalBurner
 
-# ---------- defaults ----------
+# Default configuration
 INPUT_ROOT = Path("/dev/shm/signal-burn/hf25/cha1")
 CACHE_DIR = Path("/pool/signal_storage/cache")
 DATASET_NAME = "rf_data"
 FFT_SIZE = 262144
 FS = 25_000_000
 OUT_PNG = "images/spectrogram_final.png"
-# ------------------------------
 
 
 def latest_input_dir(base_dir: Path) -> Path:

@@ -15,6 +15,7 @@ import argparse
 import csv
 import logging
 import logging.handlers
+import os
 import re
 import signal
 import subprocess
@@ -22,14 +23,12 @@ import sys
 import time
 from collections import defaultdict, deque
 from pathlib import Path
-import os
-
 
 import numpy as np
 
 from sblib.SignalBurner import SignalBurner
 
-# ---------- defaults ----------
+# Default configuration
 CHA_ROOTS = [
     Path("/dev/shm/hf25/cha1/data"),
     Path("/dev/shm/hf25/cha2/data"),
@@ -50,8 +49,6 @@ PHASE_OFFSET_DEG = 36.0  # e-czas phase shift
 PHASE_SAMPLING_HZ = 500.0  # unified phase.csv sampling rate
 DETREND_WINDOW_SEC = 300.0  # rolling window used to estimate oscillator drift
 DETREND_REFIT_INTERVAL_SEC = 1.0  # how often the linear fit is recomputed
-# ----------------------------------
-
 
 logger = logging.getLogger("sdr_live")
 
@@ -110,15 +107,13 @@ def is_temp_file(fp: Path) -> bool:
 
 
 class PhaseDetrender:
-    """Per-channel online phase unwrap + rolling-window linear-drift removal.
+    """Online per-channel phase unwrapping with rolling-window detrending.
 
-    Tracks a continuously unwrapped phase (so wraparounds at +-180 deg don't
-    show up as jumps), keeps a rolling window of (time, unwrapped_deg)
-    samples, and periodically refits a linear trend (deg/s) to that window.
-    The trend is evaluated (extrapolated) for every incoming sample between
-    refits, and the residual (unwrapped - trend) is what gets written out -
-    this is the oscillator/frequency-offset component removed, leaving the
-    slower structure (e.g. diurnal ionospheric wave) visible on its own.
+    Tracks a continuously unwrapped phase so wraparounds at ±180° do not
+    appear as jumps. The class keeps a rolling window of (time, unwrapped_deg)
+    samples and periodically refits a linear trend (deg/s) to that window.
+    The residual signal (unwrapped minus trend) is what gets written out,
+    leaving the slower underlying structure visible.
     """
 
     def __init__(self, sampling_hz, window_sec, refit_interval_sec):
@@ -133,7 +128,7 @@ class PhaseDetrender:
         self._fit_t0 = None
 
     def update(self, t_sec, wrapped_deg):
-        # --- incremental unwrap relative to the last sample ---
+        # Incrementally unwrap relative to the previous sample.
         if self._last_unwrapped_deg is None:
             unwrapped = wrapped_deg
         else:
@@ -149,8 +144,11 @@ class PhaseDetrender:
         self._buffer_t.append(t_sec)
         self._buffer_phase.append(unwrapped)
 
-        # --- periodically refit the linear (oscillator-drift) trend ---
-        if self._last_refit_t is None or (t_sec - self._last_refit_t) >= self._refit_interval_sec:
+        # Refit the linear drift trend periodically.
+        if (
+            self._last_refit_t is None
+            or (t_sec - self._last_refit_t) >= self._refit_interval_sec
+        ):
             if len(self._buffer_t) >= 2:
                 t_arr = np.asarray(self._buffer_t, dtype=np.float64)
                 p_arr = np.asarray(self._buffer_phase, dtype=np.float64)
@@ -164,7 +162,9 @@ class PhaseDetrender:
         if self._fit_t0 is None:
             trend = 0.0
         else:
-            trend = self._slope_deg_per_sec * (t_sec - self._fit_t0) + self._intercept_deg
+            trend = (
+                self._slope_deg_per_sec * (t_sec - self._fit_t0) + self._intercept_deg
+            )
 
         residual = unwrapped - trend
         return residual, self._slope_deg_per_sec

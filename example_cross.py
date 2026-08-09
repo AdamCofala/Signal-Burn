@@ -9,7 +9,7 @@ from sblib.SignalBurner import SignalBurner
 
 os.environ["HDF5_USE_FILE_LOCKING"] = "FALSE"
 
-# ---------- defaults ----------
+# Default configuration
 CHA1_ROOT = Path("/dev/shm/signal-burn/hf25/cha1")
 CHA2_ROOT = Path("/dev/shm/signal-burn/hf25/cha2")
 CACHE_DIR = Path("/pool/signal_storage/cache")
@@ -20,7 +20,6 @@ OUT_PNG = "images/cross_spectrogram.png"
 MAX_RETRIES = 3
 RETRY_DELAY = 0.2
 MAX_TIME_DIFF = 0.0
-# ------------------------------
 
 
 def get_ram_usage_mb() -> float:

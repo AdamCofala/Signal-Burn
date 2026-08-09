@@ -26,7 +26,7 @@ from PyQt5.QtWidgets import QApplication, QMainWindow, QVBoxLayout, QWidget
 
 from sblib.SignalBurner import SignalBurner
 
-# ----------------------------- defaults ---------------------------------
+# Default configuration
 CHA1_ROOT = Path("/dev/shm/hf25/cha1/data")
 CHA2_ROOT = Path("/dev/shm/hf25/cha2/data")
 CACHE_DIR = Path("/pool/signal_storage/cache")
@@ -39,7 +39,6 @@ CLEAR_INPUT_FOLDER = False  # delete existing .h5 files in input folders on star
 DOWNSAMPLE_DISPLAY = 1  # keep every N-th file in display
 FREQ_DOWNSAMPLE = 64  # downsampling factor on frequency axis (1 = no reduction)
 X_FUTURE = 5.0  # seconds to extend x-axis into the future
-# ------------------------------------------------------------------------
 
 
 def latest_input_dir(base: Path) -> Path:

@@ -1,9 +1,12 @@
 """Command-line interface for single-file FFT processing."""
 
-from pathlib import Path
 import argparse
+from pathlib import Path
 
-from SignalBurner import SignalBurner
+try:
+    from sblib.SignalBurner import SignalBurner
+except ImportError:  # pragma: no cover - allows direct script execution
+    from SignalBurner import SignalBurner
 
 
 def main(argv=None):
@@ -12,14 +15,11 @@ def main(argv=None):
     parser.add_argument(
         "--dataset", default="rf_data", help="Dataset name inside the H5 file"
     )
-    parser.add_argument("--output", default=None, help="Optional output .bin path")
+    parser.add_argument("--output", default=None, help="Optional output path")
     args = parser.parse_args(argv)
 
-    burner = SignalBurner()
-    output_path = Path(args.output) if args.output is not None else None
-    out_mag = burner.process_file(
-        args.input, output_path=output_path, dataset_name=args.dataset
-    )
+    burner = SignalBurner(dataset_name=args.dataset)
+    out_mag = burner.process_file(Path(args.input))
     print(f"Processed {args.input}: {out_mag.shape[0]} magnitude samples")
 
 

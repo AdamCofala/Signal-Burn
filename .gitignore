@@ -5,6 +5,8 @@ bin/*
 *.d
 *.fatbin
 *.sh
+*.txt
+*.csv
 
 # --- Python ---
 __pycache__/
