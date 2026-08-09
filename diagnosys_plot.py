@@ -6,9 +6,12 @@ Additionally plot phase vs time from the live processor's unified phase.csv
 500 Hz, with the oscillator/frequency-offset drift already subtracted
 online before it's written).
 
+New: optionally clean modulation by selecting only the lowest-amplitude
+samples (carrier-only) and averaging their phase in sliding windows,
+then apply a low-pass filter to the cleaned phase.
 Usage:
     python3 diagnosys_plot.py --input /path/to/minute_h5/ --output ./images/
-    python3 diagnosys_plot.py --phase-csv /path/to/phase.csv --output ./images/
+    python3 diagnosys_plot.py --phase-csv /path/to/phase.csv --output ./images/ [--clean]
 """
 
 import argparse
@@ -26,6 +29,7 @@ import matplotlib.dates as mdates
 import matplotlib.ticker as ticker
 import numpy as np
 import h5py
+from scipy.signal import butter, filtfilt  # <-- dodane do filtracji
 
 # ---------- defaults ----------
 DEFAULT_INPUT_DIR = Path("/pool/signal_storage/output/minute_h5")
@@ -38,6 +42,10 @@ DEFAULT_PHASE_DOWNSAMPLE = 1
 DEFAULT_VMIN = 5
 DEFAULT_VMAX = 95
 DEFAULT_DPI = 300
+CLEAN_WINDOW_SEC = 60.0  # default rolling window for clean phase averaging
+CLEAN_PERCENTILE = 5.0  # lowest amplitude percentile to keep
+DEFAULT_FILTER_CUTOFF = 0.007  # Hz, domyślna częstotliwość graniczna LP
+DEFAULT_FILTER_ORDER = 4
 # ------------------------------
 
 # All timestamps in the HDF5/CSV files are UNIX time. Every plot is rendered
@@ -61,6 +69,20 @@ plt.rcParams.update(
         "savefig.bbox": "tight",
     }
 )
+
+
+def butter_lowpass(cutoff, fs, order=4):
+    """Projektuje cyfrowy filtr Butterwortha dolnoprzepustowy."""
+    nyq = 0.5 * fs
+    normal_cutoff = cutoff / nyq
+    b, a = butter(order, normal_cutoff, btype="low", analog=False)
+    return b, a
+
+
+def lowpass_filter(data, cutoff, fs, order=4):
+    """Filtruje sygnał filtrem dolnoprzepustowym (bez przesunięcia fazowego)."""
+    b, a = butter_lowpass(cutoff, fs, order)
+    return filtfilt(b, a, data)
 
 
 def find_h5_files(input_dir):
@@ -113,7 +135,7 @@ def load_pair_coherence(files, i, j, fft_size=DEFAULT_FFT_SIZE, time_downsample=
                 arr[idx] = f[f"pairs/{i}{j}/coherence"][:].squeeze().astype(np.float32)
         except FileNotFoundError as e:
             print(f"Warning: {e}. Filling with NaN for this file.")
-        return arr
+    return arr
 
 
 def build_freq_axis(fft_size=DEFAULT_FFT_SIZE, fs=DEFAULT_FS):
@@ -238,9 +260,6 @@ def plot_spectrogram(
     style_time_axis(ax, timestamps)
     ax.set_title(title)
     ax.grid(which="major", axis="both", linestyle=":", linewidth=0.4, alpha=0.4)
-    # Keep the plotted panel itself at 16:9 regardless of how wide/tall the
-    # frequency and time spans are (imshow uses aspect="auto" above, so
-    # without this the box shape drifts with the data's extent).
     ax.set_box_aspect(9 / 16)
 
     return im
@@ -277,20 +296,74 @@ def plot_coherence(ax, coh_data, timestamps, freq_mhz, title=""):
     return im
 
 
-def plot_phases(phase_csv: Path, output_dir: Path, time_downsample=1):
-    """Read the unified phase.csv (timestamp_ms, cha{ch}_phase_deg,
-    cha{ch}_amplitude) and plot phase per channel.
+# ----------------------------------------------------------------------
+#  Modulation cleaning for phase (carrier-only samples)
+# ----------------------------------------------------------------------
+def clean_phase_data(timestamps, phase, amplitude, window_sec=60.0, percentile=10.0):
+    """
+    Select samples with amplitude below the `percentile`-th value in each
+    sliding window of length `window_sec`, then average their phase.
 
-    The phase column is already corrected online by the live processor
-    (oscillator/frequency-offset drift subtracted via a rolling-window
-    linear fit) - this just plots it, it does not detrend again. What you
-    see here is the residual: slower structure like a diurnal ionospheric
-    wave should be visible without a dominating linear ramp.
+    Parameters
+    ----------
+    timestamps : 1D array (seconds)
+    phase : 1D array (degrees)
+    amplitude : 1D array (positive)
+    window_sec : float
+    percentile : float, 0..100
 
-    time_downsample: plot only every Nth sample. At up to 500 Hz sampling,
-    a few hours of data is millions of points - drawing every single one
-    is the main reason these plots crawl. Downsampling for the plot
-    doesn't touch the underlying CSV data, just what gets rendered.
+    Returns
+    -------
+    times_out : 1D array – window center times
+    phase_out : 1D array – average clean phase in window
+    """
+    t = np.asarray(timestamps, dtype=np.float64)
+    p = np.asarray(phase, dtype=np.float64)
+    a = np.asarray(amplitude, dtype=np.float64)
+
+    if len(t) < 2:
+        return np.array([]), np.array([])
+
+    t_start = t[0]
+    t_end = t[-1]
+    window_starts = np.arange(t_start, t_end, window_sec)
+    times_out = window_starts + window_sec / 2.0
+
+    phase_out = np.full_like(times_out, np.nan, dtype=np.float64)
+
+    idx_left = np.searchsorted(t, window_starts, side="left")
+    idx_right = np.searchsorted(t, window_starts + window_sec, side="right")
+
+    for i in range(len(window_starts)):
+        l = idx_left[i]
+        r = idx_right[i]
+        if r - l < 5:  # minimum number of samples to compute percentile
+            continue
+        amp_win = a[l:r]
+        thresh = np.percentile(amp_win, percentile)
+        mask = amp_win < thresh
+        if not np.any(mask):
+            continue
+        phase_out[i] = np.mean(p[l:r][mask])
+
+    valid = ~np.isnan(phase_out)
+    return times_out[valid], phase_out[valid]
+
+
+def plot_phases(
+    phase_csv: Path,
+    output_dir: Path,
+    time_downsample=1,
+    clean=False,
+    clean_window_sec=CLEAN_WINDOW_SEC,
+    clean_percentile=CLEAN_PERCENTILE,
+    filter_cutoff=DEFAULT_FILTER_CUTOFF,
+    filter_order=DEFAULT_FILTER_ORDER,
+):
+    """Read the unified phase.csv and plot phase per channel.
+    If clean=True, compute and plot carrier-only phase averaged in windows,
+    optionally applying a low-pass filter, and save both raw clean and
+    filtered clean CSVs.
     """
     if not phase_csv.exists():
         print(f"File {phase_csv} not found.")
@@ -336,6 +409,7 @@ def plot_phases(phase_csv: Path, output_dir: Path, time_downsample=1):
             f"({len(timestamps_plot)}/{len(timestamps_unix)} points) to keep plotting fast."
         )
 
+    # ---- standard raw phase plot ----
     for ch in range(1, num_channels + 1):
         phase_vals = np.array(data[ch]["phase"])[plot_idx]
 
@@ -352,12 +426,150 @@ def plot_phases(phase_csv: Path, output_dir: Path, time_downsample=1):
         ax.axhline(0, color="black", linewidth=0.5, alpha=0.3)
         ax.set_title(f"Channel {ch} - Phase (oscillator drift removed)")
         ax.grid(True, alpha=0.3, linestyle=":", linewidth=0.4)
-
         style_time_axis(ax, timestamps_plot, fmt="%H:%M:%S")
-
         fig.tight_layout()
         fig.savefig(output_dir / f"phase_cha{ch}.png", dpi=DEFAULT_DPI)
         plt.close(fig)
+
+    # ---- clean phase (carrier-only) ----
+    if clean:
+        print("Computing carrier-only clean phase...")
+        clean_data = {}
+        # Częstotliwość próbkowania wyczyszczonego sygnału
+        fs_clean = 1.0 / clean_window_sec
+
+        for ch in range(1, num_channels + 1):
+            t_full = timestamps_unix
+            ph_full = np.array(data[ch]["phase"])
+            amp_full = np.array(data[ch]["amplitude"])
+            t_clean, ph_clean = clean_phase_data(
+                t_full,
+                ph_full,
+                amp_full,
+                window_sec=clean_window_sec,
+                percentile=clean_percentile,
+            )
+            # Filtracja dolnoprzepustowa
+            ph_clean_filtered = None
+            if len(ph_clean) > 3 * filter_order:
+                ph_clean_filtered = lowpass_filter(
+                    ph_clean, filter_cutoff, fs_clean, filter_order
+                )
+            else:
+                print(
+                    f"Channel {ch}: too few clean samples ({len(ph_clean)}) "
+                    f"for filter order {filter_order}, skipping filter."
+                )
+                ph_clean_filtered = ph_clean  # pozostaw bez filtrowania
+
+            clean_data[ch] = (t_clean, ph_clean, ph_clean_filtered)
+
+            if len(t_clean) == 0:
+                print(f"Warning: no clean phase computed for channel {ch}.")
+                continue
+
+            # Rysowanie: surowy resztkowy (cienki, szary), czysty niefiltrowany (przerywany),
+            # czysty filtrowany (gruby zielony)
+            fig, ax = plt.subplots(figsize=(16, 9))
+            # raw residual
+            ax.plot(
+                times_dt,
+                np.array(data[ch]["phase"])[plot_idx],
+                color="gray",
+                linewidth=0.2,
+                alpha=0.4,
+                label="raw residual",
+                rasterized=True,
+            )
+
+            dt_clean = [
+                datetime.datetime.fromtimestamp(ts, tz=LOCAL_TZ) for ts in t_clean
+            ]
+            # ax.plot(
+            #     dt_clean,
+            #     ph_clean,
+            #     color="tab:blue",
+            #     linestyle="--",
+            #     linewidth=0.8,
+            #     alpha=0.7,
+            #     label=f"clean (lowest {clean_percentile}% amp)",
+            #     rasterized=True,
+            # )
+            ax.plot(
+                dt_clean,
+                ph_clean_filtered,
+                color="tab:blue",
+                linewidth=0.8,
+                alpha=0.95,
+                label=f"clean + LP filter (cutoff {filter_cutoff} Hz)",
+                rasterized=True,
+            )
+            ax.set_ylabel("Phase [deg]")
+            ax.axhline(0, color="black", linewidth=0.5, alpha=0.3)
+            ax.set_title(f"Channel {ch} - Clean Phase (carrier only) + Low‑pass filter")
+            ax.legend(loc="upper right")
+            ax.grid(True, alpha=0.3, linestyle=":", linewidth=0.4)
+            style_time_axis(ax, timestamps_plot, fmt="%H:%M:%S")
+            fig.tight_layout()
+            fig.savefig(output_dir / f"phase_cha{ch}_clean.png", dpi=DEFAULT_DPI)
+            plt.close(fig)
+
+        # Zapis czystego niefiltrowanego (oryginalny clean)
+        clean_csv_path = output_dir / "phase_clean.csv"
+        with open(clean_csv_path, "w", newline="") as f:
+            writer = csv.writer(f)
+            header = ["timestamp_ms"]
+            for ch in range(1, num_channels + 1):
+                header.append(f"cha{ch}_clean_phase_deg")
+            writer.writerow(header)
+            all_times = set()
+            for ch in range(1, num_channels + 1):
+                all_times.update(clean_data[ch][0])
+            all_times = sorted(all_times)
+            for t in all_times:
+                row = [int(t * 1000)]
+                for ch in range(1, num_channels + 1):
+                    t_ch, ph_ch, _ = clean_data[ch]
+                    if len(t_ch) == 0:
+                        row.append("")
+                        continue
+                    idx = np.argmin(np.abs(t_ch - t))
+                    if abs(t_ch[idx] - t) < clean_window_sec * 0.5:
+                        row.append(f"{ph_ch[idx]:.6f}")
+                    else:
+                        row.append("")
+                writer.writerow(row)
+        print(f"Unfiltered clean phase CSV saved to {clean_csv_path}")
+
+        # Zapis czystego po filtracji
+        filt_csv_path = output_dir / "phase_clean_filtered.csv"
+        with open(filt_csv_path, "w", newline="") as f:
+            writer = csv.writer(f)
+            header = ["timestamp_ms"]
+            for ch in range(1, num_channels + 1):
+                header.append(f"cha{ch}_clean_filtered_phase_deg")
+            writer.writerow(header)
+            # Używamy tych samych czasów okien (t_clean), ale filtrowane wartości
+            all_times = set()
+            for ch in range(1, num_channels + 1):
+                all_times.update(clean_data[ch][0])
+            all_times = sorted(all_times)
+            for t in all_times:
+                row = [int(t * 1000)]
+                for ch in range(1, num_channels + 1):
+                    t_ch, _, ph_filt = clean_data[ch]
+                    if len(t_ch) == 0:
+                        row.append("")
+                        continue
+                    idx = np.argmin(np.abs(t_ch - t))
+                    if abs(t_ch[idx] - t) < clean_window_sec * 0.5:
+                        row.append(f"{ph_filt[idx]:.6f}")
+                    else:
+                        row.append("")
+                writer.writerow(row)
+        print(f"Filtered clean phase CSV saved to {filt_csv_path}")
+
+        print(f"Clean phase plots saved to {output_dir}")
 
     print(f"Phase plots saved to {output_dir}")
 
@@ -381,6 +593,37 @@ def main():
         "plotting fast for long high-rate captures (default: %(default)s, "
         "i.e. no downsampling)",
     )
+    # --- clean arguments ---
+    parser.add_argument(
+        "--clean",
+        action="store_true",
+        help="Compute and plot carrier-only (lowest amplitude) phase averaged in windows.",
+    )
+    parser.add_argument(
+        "--clean-window",
+        type=float,
+        default=CLEAN_WINDOW_SEC,
+        help="Rolling window length in seconds for clean phase averaging (default: %(default)s).",
+    )
+    parser.add_argument(
+        "--clean-percentile",
+        type=float,
+        default=CLEAN_PERCENTILE,
+        help="Amplitude percentile threshold for selecting carrier-only samples (default: %(default)s).",
+    )
+    # --- low-pass filter arguments ---
+    parser.add_argument(
+        "--filter-cutoff",
+        type=float,
+        default=DEFAULT_FILTER_CUTOFF,
+        help="Low-pass filter cutoff frequency in Hz (default: %(default)s).",
+    )
+    parser.add_argument(
+        "--filter-order",
+        type=int,
+        default=DEFAULT_FILTER_ORDER,
+        help="Order of the Butterworth low-pass filter (default: %(default)s).",
+    )
     parser.add_argument("--dpi", type=int, default=DEFAULT_DPI)
     args = parser.parse_args()
 
@@ -389,7 +632,14 @@ def main():
 
     if args.phase_csv:
         plot_phases(
-            args.phase_csv, output_dir, time_downsample=args.phase_time_downsample
+            args.phase_csv,
+            output_dir,
+            time_downsample=args.phase_time_downsample,
+            clean=args.clean,
+            clean_window_sec=args.clean_window,
+            clean_percentile=args.clean_percentile,
+            filter_cutoff=args.filter_cutoff,
+            filter_order=args.filter_order,
         )
         if not args.input:
             return
