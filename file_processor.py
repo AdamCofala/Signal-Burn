@@ -3,23 +3,19 @@
 Real-time I/Q processor - unified high-rate phase sampling with online
 oscillator-drift (linear trend) subtraction.
 
-phase.csv now contains phase already corrected for the local-oscillator /
-reference-carrier frequency offset (the linear drift you'd otherwise see
-in a raw unwrapped-phase plot). The correction is estimated online from a
-rolling window of recent samples and updated once per second; what's left
-in phase.csv is the residual (e.g. the slower ionospheric/diurnal wave),
-not the raw drifting phase.
+Power spectra + complex cross-spectra are accumulated over 60 seconds
+and saved into a single minute_<unix_time>.h5 file.
+High-rate phase samples (with online detrend) go to phase.csv.
+
+Performance log every 10 seconds.
 """
 
 import argparse
 import csv
 import logging
 import logging.handlers
-import os
-import re
-import signal
-import subprocess
 import sys
+import re
 import time
 from collections import defaultdict, deque
 from pathlib import Path
@@ -39,16 +35,15 @@ FS = 25_000_000
 CACHE_DIR = Path("/pool/signal_storage/cache")
 DATASET_NAME = "rf_data"
 OUTPUT_DIR = Path("/pool/signal_storage/output")
-SELECTED_FREQUENCIES_HZ = [1e6, 5e6, 10e6]
 POLL_INTERVAL = 0.4
 MAX_TIME_DIFF = 0.0
-HEARTBEAT_INTERVAL = 30.0
+HEARTBEAT_INTERVAL = 10.0
 LOG_RETENTION_DAYS = 14
-TARGET_FREQ_HZ = 12_500_000 - 225_000  # = 12_275_000 Hz
-PHASE_OFFSET_DEG = 36.0  # e-czas phase shift
-PHASE_SAMPLING_HZ = 500.0  # unified phase.csv sampling rate
-DETREND_WINDOW_SEC = 300.0  # rolling window used to estimate oscillator drift
-DETREND_REFIT_INTERVAL_SEC = 1.0  # how often the linear fit is recomputed
+TARGET_FREQ_HZ = 12_500_000 - 225_000
+PHASE_OFFSET_DEG = 36.0
+PHASE_SAMPLING_HZ = 500.0
+DETREND_WINDOW_SEC = 300.0
+DETREND_REFIT_INTERVAL_SEC = 1.0
 
 logger = logging.getLogger("sdr_live")
 
@@ -107,15 +102,6 @@ def is_temp_file(fp: Path) -> bool:
 
 
 class PhaseDetrender:
-    """Online per-channel phase unwrapping with rolling-window detrending.
-
-    Tracks a continuously unwrapped phase so wraparounds at ±180° do not
-    appear as jumps. The class keeps a rolling window of (time, unwrapped_deg)
-    samples and periodically refits a linear trend (deg/s) to that window.
-    The residual signal (unwrapped minus trend) is what gets written out,
-    leaving the slower underlying structure visible.
-    """
-
     def __init__(self, sampling_hz, window_sec, refit_interval_sec):
         buffer_len = max(2, int(sampling_hz * window_sec))
         self._buffer_t = deque(maxlen=buffer_len)
@@ -128,7 +114,6 @@ class PhaseDetrender:
         self._fit_t0 = None
 
     def update(self, t_sec, wrapped_deg):
-        # Incrementally unwrap relative to the previous sample.
         if self._last_unwrapped_deg is None:
             unwrapped = wrapped_deg
         else:
@@ -144,7 +129,6 @@ class PhaseDetrender:
         self._buffer_t.append(t_sec)
         self._buffer_phase.append(unwrapped)
 
-        # Refit the linear drift trend periodically.
         if (
             self._last_refit_t is None
             or (t_sec - self._last_refit_t) >= self._refit_interval_sec
@@ -179,7 +163,6 @@ class LiveProcessor:
         cache_dir,
         dataset_name,
         output_dir,
-        selected_freqs_hz,
         poll_interval,
         max_time_diff,
         target_freq_hz,
@@ -187,14 +170,13 @@ class LiveProcessor:
         phase_sampling_hz=0.0,
         detrend_window_sec=DETREND_WINDOW_SEC,
         detrend_refit_interval_sec=DETREND_REFIT_INTERVAL_SEC,
-        heartbeat_interval=30,
+        heartbeat_interval=10,
     ):
         self.cha_roots = [Path(p) for p in cha_roots]
         self.num_channels = len(self.cha_roots)
         self.fft_size = fft_size
         self.fs = fs
         self.output_dir = Path(output_dir)
-        self.selected_freqs_hz = selected_freqs_hz
         self.poll_interval = poll_interval
         self.max_time_diff = max_time_diff
         self.target_freq_hz = target_freq_hz
@@ -202,15 +184,10 @@ class LiveProcessor:
         self.phase_sampling_hz = phase_sampling_hz
         self.heartbeat_interval = heartbeat_interval
 
-        self.second_log_path = self.output_dir / "second_fft.csv"
-        self.phase_log_path = self.output_dir / "phase.csv"
         self.minute_h5_dir = self.output_dir / "minute_h5"
         self.minute_h5_dir.mkdir(parents=True, exist_ok=True)
 
-        freq_axis = np.fft.fftshift(np.fft.fftfreq(fft_size, d=1 / fs))
-        self.selected_bins = [
-            np.argmin(np.abs(freq_axis - f)) for f in selected_freqs_hz
-        ]
+        self.phase_log_path = self.output_dir / "phase.csv"
 
         t0 = time.perf_counter()
         self.sb = SignalBurner(
@@ -241,15 +218,14 @@ class LiveProcessor:
         self._start_time = time.time()
         self._last_heartbeat = self._start_time
         self._seconds_processed = 0
-        self._minutes_saved = 0
-        self._last_minute_saved_at = None
-        self._discovered_since_heartbeat = 0
         self._errors_since_heartbeat = 0
 
         self._fft_times_rolling = deque(maxlen=59)
         self._phase_times_rolling = deque(maxlen=59)
 
-        # For high-rate phase sampling + online oscillator-drift removal
+        # Minute accumulation buffer: dict of minute_start_ts -> list of sec dicts
+        self._minute_buffer = defaultdict(list)
+
         if self.phase_sampling_hz > 0:
             self._phase_period = 1.0 / self.phase_sampling_hz
             self._last_phase_sample_time = 0.0
@@ -298,17 +274,13 @@ class LiveProcessor:
             logger.debug(
                 "Discovered %d new file(s) on cha%d", new_count, channel_idx + 1
             )
-            self._discovered_since_heartbeat += new_count
 
     def _process_second(self, ts_int: int) -> bool:
         if len(self.pending[ts_int]) < self.num_channels:
             return False
 
-        files, timestamps = [], []
-        for ch in range(self.num_channels):
-            ts, fp = self.pending[ts_int][ch]
-            files.append(fp)
-            timestamps.append(ts)
+        files = [self.pending[ts_int][ch][1] for ch in range(self.num_channels)]
+        timestamps = [self.pending[ts_int][ch][0] for ch in range(self.num_channels)]
 
         if self.max_time_diff == 0.0 and not all(
             abs(t - timestamps[0]) < 1e-9 for t in timestamps[1:]
@@ -321,52 +293,50 @@ class LiveProcessor:
             return False
 
         total_start = time.perf_counter()
-        need_coh = ts_int % 60 == 0
 
         try:
-            # 1. Power spectra
-            if not need_coh:
-                ffts = {}
-                fft_time_sum = 0.0
-                for ch in range(self.num_channels):
-                    t0 = time.perf_counter()
-                    ffts[ch] = self.sb.process_file(files[ch])
-                    fft_time_sum += time.perf_counter() - t0
-                self._fft_times_rolling.append(fft_time_sum)
-            else:
-                t0 = time.perf_counter()
-                res = self.sb.process_triple_all(files[0], files[1], files[2])
-                triple_time = time.perf_counter() - t0
-                ffts = {0: res["power1"], 1: res["power2"], 2: res["power3"]}
-                coh_data = {
-                    (0, 1): res["coherence12"],
-                    (0, 2): res["coherence13"],
-                    (1, 2): res["coherence23"],
-                }
+            t0 = time.perf_counter()
+            cross_res = self.sb.process_triple_cross_spectra(
+                files[0], files[1], files[2],
+                compute_power=True,
+                compute_cross_spectrum=True,
+                compute_phase=False,
+            )
+            triple_time = time.perf_counter() - t0
+            self._fft_times_rolling.append(triple_time)
 
-            self._write_second_log(ts_int, [ffts[i] for i in range(self.num_channels)])
-
-            # 2. High-rate phase sampling (unified phase.csv, oscillator drift
-            # already subtracted online before writing)
             phase_time = 0.0
             if self.phase_sampling_hz > 0:
                 phase_start = time.perf_counter()
                 self._phase_sample(files, timestamps)
                 phase_time = time.perf_counter() - phase_start
-                if not need_coh:
-                    self._phase_times_rolling.append(phase_time)
+                self._phase_times_rolling.append(phase_time)
 
-            # 3. Minute snapshot
-            if need_coh:
-                total_time = time.perf_counter() - total_start
-                self._save_minute_snapshot(
-                    ts_int,
-                    ffts,
-                    coh_data,
-                    triple_time,
-                    total_time,
-                    phase_time=phase_time,
-                )
+            total_time = time.perf_counter() - total_start
+
+            # Prepare second data dict
+            sec_data = {
+                "ts": ts_int,
+                "power1": cross_res["power1"],
+                "power2": cross_res["power2"],
+                "power3": cross_res["power3"],
+                "cross12_real": cross_res["cross12_real"],
+                "cross12_imag": cross_res["cross12_imag"],
+                "cross13_real": cross_res["cross13_real"],
+                "cross13_imag": cross_res["cross13_imag"],
+                "cross23_real": cross_res["cross23_real"],
+                "cross23_imag": cross_res["cross23_imag"],
+            }
+
+            minute_start = (ts_int // 60) * 60
+            self._minute_buffer[minute_start].append(sec_data)
+
+            # If this is the last second of the minute (ts_int % 60 == 59), save the minute file
+            # We also flush any partial minute at the end of run (handled in run())
+            if ts_int % 60 == 59:
+                self._flush_minute(minute_start)
+                # after flush, remove buffer to free memory
+                del self._minute_buffer[minute_start]
 
             del self.pending[ts_int]
             self._seconds_processed += 1
@@ -378,15 +348,13 @@ class LiveProcessor:
             return False
 
     def _phase_sample(self, files, timestamps):
-        """Take a high-rate phase sample, subtract the online-estimated
-        oscillator drift, and append it to the unified phase.csv."""
         now = time.time()
         if now - self._last_phase_sample_time < self._phase_period:
             return
         self._last_phase_sample_time = now
 
         t_sec = timestamps[0]
-        row = [int(t_sec * 1000)]  # timestamp in ms
+        row = [int(t_sec * 1000)]
         for ch, fp in enumerate(files):
             z = self.sb.process_baseband_iq(
                 fp, target_freq_hz=self.target_freq_hz, fs=self.fs
@@ -408,85 +376,93 @@ class LiveProcessor:
                 writer.writerow(header)
             writer.writerow(row)
 
-    def _write_second_log(self, ts_int, ffts):
-        row = [ts_int]
-        for ch_fft in ffts:
-            for bin_idx in self.selected_bins:
-                row.append(ch_fft[bin_idx])
-        write_header = not self.second_log_path.exists()
-        with open(self.second_log_path, "a", newline="") as f:
-            w = csv.writer(f)
-            if write_header:
-                h = ["second"]
-                for ch in range(1, self.num_channels + 1):
-                    for f_hz in SELECTED_FREQUENCIES_HZ:
-                        h.append(f"cha{ch}_{f_hz / 1e6:.2f}MHz")
-                w.writerow(h)
-            w.writerow(row)
+    def _flush_minute(self, minute_start: int):
+        """Save accumulated seconds for a minute to an HDF5 file."""
+        if minute_start not in self._minute_buffer:
+            return
 
-    def _save_minute_snapshot(
-        self, ts_int, ffts, coh_data, triple_time, total_time, phase_time=0.0
-    ):
-        minute_start = (ts_int // 60) * 60
+        seconds_list = sorted(self._minute_buffer[minute_start], key=lambda x: x["ts"])
+        if not seconds_list:
+            return
+
+        n_sec = len(seconds_list)
+        fft_len = self.fft_size
+
+        # Pre-allocate arrays
+        timestamps = np.empty(n_sec, dtype=np.float64)
+        pow1 = np.empty((n_sec, fft_len), dtype=np.float32)
+        pow2 = np.empty((n_sec, fft_len), dtype=np.float32)
+        pow3 = np.empty((n_sec, fft_len), dtype=np.float32)
+
+        cross12_real = np.empty((n_sec, fft_len), dtype=np.float32)
+        cross12_imag = np.empty((n_sec, fft_len), dtype=np.float32)
+        cross13_real = np.empty((n_sec, fft_len), dtype=np.float32)
+        cross13_imag = np.empty((n_sec, fft_len), dtype=np.float32)
+        cross23_real = np.empty((n_sec, fft_len), dtype=np.float32)
+        cross23_imag = np.empty((n_sec, fft_len), dtype=np.float32)
+
+        for idx, sec in enumerate(seconds_list):
+            timestamps[idx] = sec["ts"]
+            pow1[idx] = sec["power1"]
+            pow2[idx] = sec["power2"]
+            pow3[idx] = sec["power3"]
+            cross12_real[idx] = sec["cross12_real"]
+            cross12_imag[idx] = sec["cross12_imag"]
+            cross13_real[idx] = sec["cross13_real"]
+            cross13_imag[idx] = sec["cross13_imag"]
+            cross23_real[idx] = sec["cross23_real"]
+            cross23_imag[idx] = sec["cross23_imag"]
+
         h5_path = self.minute_h5_dir / f"minute_{minute_start}.h5"
-        datasets = {}
-        for ch in range(self.num_channels):
-            datasets[f"cha{ch + 1}/fft"] = ffts[ch].reshape(1, -1)
-        for (i, j), coh in coh_data.items():
-            datasets[f"pairs/{i + 1}{j + 1}/coherence"] = coh.reshape(1, -1)
-        datasets["timestamps"] = np.array([ts_int], dtype=np.float64)
-        t0 = time.perf_counter()
-        self.sb.save_to_h5(
-            h5_path=h5_path,
-            datasets=datasets,
-            metadata={"fs": self.fs, "fft_size": self.fft_size},
-        )
-        save_time = time.perf_counter() - t0
-        self._minutes_saved += 1
-        self._last_minute_saved_at = minute_start
-        avg_fft = (
-            sum(self._fft_times_rolling) / len(self._fft_times_rolling)
-            if self._fft_times_rolling
-            else 0
-        )
-        avg_phase = (
-            sum(self._phase_times_rolling) / len(self._phase_times_rolling)
-            if self._phase_times_rolling
-            else 0
-        )
-        logger.info(
-            f"Minute {minute_start} snapshot -> {h5_path} ({save_time:.4f}s save)\n"
-            f"    Triple-all: {triple_time:.4f}s\n"
-            f"    Phase sample (detrend): {phase_time:.6f}s\n"
-            f"    Avg FFT/sec: {avg_fft:.4f}s\n"
-            f"    Avg phase/sec: {avg_phase:.6f}s\n"
-            f"    Total second: {total_time:.4f}s"
-        )
+        datasets = {
+            "timestamps": timestamps,
+            "cha1/fft": pow1,
+            "cha2/fft": pow2,
+            "cha3/fft": pow3,
+            "pairs/12/real": cross12_real,
+            "pairs/12/imag": cross12_imag,
+            "pairs/13/real": cross13_real,
+            "pairs/13/imag": cross13_imag,
+            "pairs/23/real": cross23_real,
+            "pairs/23/imag": cross23_imag,
+        }
+        metadata = {"fs": self.fs, "fft_size": self.fft_size}
+        self.sb.save_to_h5(h5_path, datasets, metadata=metadata, mode="w")
+        logger.info("Minute %d saved with %d seconds -> %s", minute_start, n_sec, h5_path)
 
     def _maybe_heartbeat(self):
         now = time.time()
         if now - self._last_heartbeat < self.heartbeat_interval:
             return
+
         uptime = now - self._start_time
-        last_minute = (
-            f"minute_{self._last_minute_saved_at}"
-            if self._last_minute_saved_at
-            else "none yet"
+        avg_fft = (
+            sum(self._fft_times_rolling) / len(self._fft_times_rolling)
+            if self._fft_times_rolling
+            else 0.0
+        )
+        avg_phase = (
+            sum(self._phase_times_rolling) / len(self._phase_times_rolling)
+            if self._phase_times_rolling
+            else 0.0
         )
         logger.info(
-            "status: alive | uptime=%.0fs | seconds_processed=%d | minutes_saved=%d "
-            "| pending=%d | new_files=%d | errors=%d | last_snapshot=%s",
+            "stats: uptime=%.0fs | seconds_processed=%d | pending=%d | "
+            "errors=%d | avg_fft=%.4fs | avg_phase=%.6fs",
             uptime,
             self._seconds_processed,
-            self._minutes_saved,
             len(self.pending),
-            self._discovered_since_heartbeat,
             self._errors_since_heartbeat,
-            last_minute,
+            avg_fft,
+            avg_phase,
         )
         self._last_heartbeat = now
-        self._discovered_since_heartbeat = 0
         self._errors_since_heartbeat = 0
+
+    def _flush_all_buffers(self):
+        """Save any remaining partial minutes on shutdown."""
+        for minute_start in sorted(self._minute_buffer.keys()):
+            self._flush_minute(minute_start)
 
     def run(self):
         logger.info("Processor started. Press Ctrl+C to stop.")
@@ -515,6 +491,7 @@ class LiveProcessor:
         except KeyboardInterrupt:
             logger.info("Stopped.")
         finally:
+            self._flush_all_buffers()
             self.sb.shutdown()
 
 
@@ -526,9 +503,6 @@ def main():
     parser.add_argument("--cache", type=Path, default=CACHE_DIR)
     parser.add_argument("--dataset", default=DATASET_NAME)
     parser.add_argument("--output", type=Path, default=OUTPUT_DIR)
-    parser.add_argument(
-        "--freqs", nargs="+", type=float, default=SELECTED_FREQUENCIES_HZ
-    )
     parser.add_argument("--poll", type=float, default=POLL_INTERVAL)
     parser.add_argument("--max-diff", type=float, default=MAX_TIME_DIFF)
     parser.add_argument("--target-freq-hz", type=float, default=TARGET_FREQ_HZ)
@@ -548,16 +522,13 @@ def main():
         "--detrend-window-sec",
         type=float,
         default=DETREND_WINDOW_SEC,
-        help="Rolling window (seconds) used to estimate and subtract the "
-        "oscillator/frequency-offset drift before writing phase.csv "
-        "(default: %(default)s)",
+        help="Rolling window (seconds) used for drift subtraction",
     )
     parser.add_argument(
         "--detrend-refit-interval-sec",
         type=float,
         default=DETREND_REFIT_INTERVAL_SEC,
-        help="How often (seconds) the linear drift fit is recomputed "
-        "(default: %(default)s)",
+        help="How often the drift fit is recomputed",
     )
     parser.add_argument("-v", "--verbose", action="store_true")
     args = parser.parse_args()
@@ -569,7 +540,6 @@ def main():
         cache_dir=args.cache,
         dataset_name=args.dataset,
         output_dir=args.output,
-        selected_freqs_hz=args.freqs,
         poll_interval=args.poll,
         max_time_diff=args.max_diff,
         target_freq_hz=args.target_freq_hz,
@@ -577,6 +547,7 @@ def main():
         phase_sampling_hz=args.phase_sampling_hz,
         detrend_window_sec=args.detrend_window_sec,
         detrend_refit_interval_sec=args.detrend_refit_interval_sec,
+        heartbeat_interval=10,
     )
     proc.run()
 

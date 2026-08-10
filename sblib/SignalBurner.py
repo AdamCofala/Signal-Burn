@@ -119,6 +119,30 @@ class SignalBurner:
                 lib.sb_shutdown.argtypes = []
                 lib.sb_shutdown.restype = None
 
+            # New function
+            if hasattr(lib, "sb_process_triple_cross_spectra"):
+                lib.sb_process_triple_cross_spectra.argtypes = [
+                    ctypes.POINTER(ctypes.c_int16),  # in1
+                    ctypes.POINTER(ctypes.c_int16),  # in2
+                    ctypes.POINTER(ctypes.c_int16),  # in3
+                    ctypes.c_size_t,  # num_samples
+                    ctypes.POINTER(ctypes.c_float),  # out_pow1
+                    ctypes.POINTER(ctypes.c_float),  # out_pow2
+                    ctypes.POINTER(ctypes.c_float),  # out_pow3
+                    ctypes.POINTER(ctypes.c_float),  # out_cross12_real
+                    ctypes.POINTER(ctypes.c_float),  # out_cross12_imag
+                    ctypes.POINTER(ctypes.c_float),  # out_cross13_real
+                    ctypes.POINTER(ctypes.c_float),  # out_cross13_imag
+                    ctypes.POINTER(ctypes.c_float),  # out_cross23_real
+                    ctypes.POINTER(ctypes.c_float),  # out_cross23_imag
+                    ctypes.POINTER(ctypes.c_float),  # out_cross12_phase
+                    ctypes.POINTER(ctypes.c_float),  # out_cross13_phase
+                    ctypes.POINTER(ctypes.c_float),  # out_cross23_phase
+                    ctypes.c_int,  # fft_size
+                    ctypes.c_uint,  # flags
+                ]
+                lib.sb_process_triple_cross_spectra.restype = ctypes.c_int
+
             self._lib = lib
         return self._lib
 
@@ -479,3 +503,119 @@ class SignalBurner:
                     f.unlink()
                     deleted += 1
         return deleted
+
+    # ------------------------------------------------------------------
+    # NEW: process_triple_cross_spectra
+    # ------------------------------------------------------------------
+    def process_triple_cross_spectra(
+        self,
+        h5_path1: Path,
+        h5_path2: Path,
+        h5_path3: Path,
+        compute_power: bool = True,
+        compute_cross_spectrum: bool = True,
+        compute_phase: bool = False,
+    ) -> dict:
+        """
+        Process three I/Q files and return cross-spectra, power spectra,
+        and optionally phases – without coherence calculation.
+
+        Parameters
+        ----------
+        compute_power : if True, return 'power1', 'power2', 'power3'
+        compute_cross_spectrum : if True, return 'cross12_real', 'cross12_imag', etc.
+        compute_phase : if True, return 'cross12_phase', etc.
+
+        Returns
+        -------
+        dict with the requested arrays.
+        """
+        if not hasattr(self._lib, "sb_process_triple_cross_spectra"):
+            raise RuntimeError(
+                "Library does not support sb_process_triple_cross_spectra"
+            )
+
+        data1, nsamp1 = self.load_iq_data(h5_path1)
+        data2, nsamp2 = self.load_iq_data(h5_path2)
+        data3, nsamp3 = self.load_iq_data(h5_path3)
+        if nsamp1 != nsamp2 or nsamp2 != nsamp3:
+            raise ValueError("Sample count mismatch")
+        if nsamp1 == 0:
+            raise ValueError("No samples")
+
+        n = self.fft_size
+
+        # Prepare arrays (only if requested, otherwise None)
+        pow1 = np.empty(n, dtype=np.float32) if compute_power else None
+        pow2 = np.empty(n, dtype=np.float32) if compute_power else None
+        pow3 = np.empty(n, dtype=np.float32) if compute_power else None
+
+        cr12_real = np.empty(n, dtype=np.float32) if compute_cross_spectrum else None
+        cr12_imag = np.empty(n, dtype=np.float32) if compute_cross_spectrum else None
+        cr13_real = np.empty(n, dtype=np.float32) if compute_cross_spectrum else None
+        cr13_imag = np.empty(n, dtype=np.float32) if compute_cross_spectrum else None
+        cr23_real = np.empty(n, dtype=np.float32) if compute_cross_spectrum else None
+        cr23_imag = np.empty(n, dtype=np.float32) if compute_cross_spectrum else None
+
+        ph12 = np.empty(n, dtype=np.float32) if compute_phase else None
+        ph13 = np.empty(n, dtype=np.float32) if compute_phase else None
+        ph23 = np.empty(n, dtype=np.float32) if compute_phase else None
+
+        flags = 0
+        if compute_power:
+            flags |= 0x01
+        if compute_cross_spectrum:
+            flags |= 0x02
+        if compute_phase:
+            flags |= 0x04
+
+        # Helper: pass NULL pointer if array is None
+        def ptr(arr):
+            return (
+                arr.ctypes.data_as(ctypes.POINTER(ctypes.c_float))
+                if arr is not None
+                else ctypes.POINTER(ctypes.c_float)()
+            )
+
+        ret = self._lib.sb_process_triple_cross_spectra(
+            data1.ctypes.data_as(ctypes.POINTER(ctypes.c_int16)),
+            data2.ctypes.data_as(ctypes.POINTER(ctypes.c_int16)),
+            data3.ctypes.data_as(ctypes.POINTER(ctypes.c_int16)),
+            ctypes.c_size_t(nsamp1),
+            ptr(pow1),
+            ptr(pow2),
+            ptr(pow3),
+            ptr(cr12_real),
+            ptr(cr12_imag),
+            ptr(cr13_real),
+            ptr(cr13_imag),
+            ptr(cr23_real),
+            ptr(cr23_imag),
+            ptr(ph12),
+            ptr(ph13),
+            ptr(ph23),
+            ctypes.c_int(n),
+            ctypes.c_uint(flags),
+        )
+        if ret != 0:
+            raise RuntimeError(f"sb_process_triple_cross_spectra failed (code {ret})")
+
+        result = {}
+        if compute_power:
+            result.update(power1=pow1, power2=pow2, power3=pow3)
+        if compute_cross_spectrum:
+            result.update(
+                cross12_real=cr12_real,
+                cross12_imag=cr12_imag,
+                cross13_real=cr13_real,
+                cross13_imag=cr13_imag,
+                cross23_real=cr23_real,
+                cross23_imag=cr23_imag,
+            )
+        if compute_phase:
+            result.update(
+                cross12_phase=ph12,
+                cross13_phase=ph13,
+                cross23_phase=ph23,
+            )
+        return result

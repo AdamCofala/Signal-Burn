@@ -164,6 +164,30 @@ __global__ void complexAvgStream(const IQSample* in, float* real_sum, float* ima
     }
 }
 
+// Nowe kernele do ekstrakcji składowych widma wzajemnego
+__global__ void extractComplex(const cufftComplex* accum, float* real, float* imag, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) {
+        real[i] = accum[i].x;
+        imag[i] = accum[i].y;
+    }
+}
+
+__global__ void extractPhase(const cufftComplex* accum, float* phase, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) {
+        phase[i] = atan2f(accum[i].y, accum[i].x);
+    }
+}
+
+__global__ void shiftComplex(const cufftComplex* in, cufftComplex* out, int n) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n) {
+        int shift = n / 2;
+        int src_idx = (idx + shift) % n;
+        out[idx] = in[src_idx];
+    }
+}
 
 // ---------------------------------------------------------------------
 //  Global state & plans
@@ -624,6 +648,123 @@ int sb_process_baseband_iq_full(const int16_t* interleaved_iq, size_t num_sample
 
     *out_real = real_sum / (float)num_samples;
     *out_imag = imag_sum / (float)num_samples;
+
+    return 0;
+}
+
+// ---------------------------------------------------------------------
+//  NEW: sb_process_triple_cross_spectra
+// ---------------------------------------------------------------------
+#define FLAG_POWER          0x01
+#define FLAG_CROSS_COMPLEX  0x02
+#define FLAG_CROSS_PHASE    0x04
+
+int sb_process_triple_cross_spectra(
+    const int16_t* in1, const int16_t* in2, const int16_t* in3,
+    size_t num_samples,
+    float* out_pow1, float* out_pow2, float* out_pow3,
+    float* out_cross12_real, float* out_cross12_imag,
+    float* out_cross13_real, float* out_cross13_imag,
+    float* out_cross23_real, float* out_cross23_imag,
+    float* out_cross12_phase, float* out_cross13_phase, float* out_cross23_phase,
+    int fft_size, unsigned int flags)
+{
+    if (num_samples < (size_t)fft_size) return -1;
+    std::lock_guard<std::mutex> lock(g_state_mutex);
+
+    if (fft_size > g_allocated_n)        reallocate_FFT_buffers(fft_size);
+    if (fft_size > g_allocated_n_cross)  reallocate_cross_corelation_buffers(fft_size);
+    reallocate_coherence_buffers(fft_size);
+    reallocate_triple_buffers(fft_size);
+
+    if (num_samples > g_allocated_in_size)  reallocate_input(num_samples);
+    if (num_samples > g_allocated_in2_size) reallocate_input2(num_samples);
+    if (num_samples > g_allocated_in3_size) reallocate_input3(num_samples);
+
+    cudaMemcpy(g_d_in,  in1, num_samples * sizeof(IQSample), cudaMemcpyHostToDevice);
+    cudaMemcpy(g_d_in2, in2, num_samples * sizeof(IQSample), cudaMemcpyHostToDevice);
+    cudaMemcpy(g_d_in3, in3, num_samples * sizeof(IQSample), cudaMemcpyHostToDevice);
+
+    cudaMemset(g_d_pow1,          0, fft_size * sizeof(float));
+    cudaMemset(g_d_pow2,          0, fft_size * sizeof(float));
+    cudaMemset(g_d_pow3,          0, fft_size * sizeof(float));
+    cudaMemset(g_d_cross_accum,   0, fft_size * sizeof(cufftComplex));
+    cudaMemset(g_d_cross13_accum, 0, fft_size * sizeof(cufftComplex));
+    cudaMemset(g_d_cross23_accum, 0, fft_size * sizeof(cufftComplex));
+
+    int num_windows = 0;
+    int stride = fft_size / 2;
+    cufftHandle plan = get_plan(fft_size);
+    if (plan == 0) return -2;
+
+    dim3 block(256);
+    dim3 grid((fft_size + 255) / 256);
+
+    for (size_t offset = 0; offset + fft_size <= num_samples; offset += stride) {
+        process_single_window(g_d_in, (int)offset, g_d_fft, g_d_pow, g_d_fft_saved1, fft_size, plan);
+        accumulate<<<grid, block>>>(g_d_pow, g_d_pow1, fft_size);
+
+        process_single_window(g_d_in2, (int)offset, g_d_fft, g_d_pow, g_d_fft_saved2, fft_size, plan);
+        accumulate<<<grid, block>>>(g_d_pow, g_d_pow2, fft_size);
+        crossAccumulate<<<grid, block>>>(g_d_fft_saved1, g_d_fft, g_d_cross_accum, fft_size);
+
+        process_single_window(g_d_in3, (int)offset, g_d_fft, g_d_pow, nullptr, fft_size, plan);
+        accumulate<<<grid, block>>>(g_d_pow, g_d_pow3, fft_size);
+        crossAccumulate<<<grid, block>>>(g_d_fft_saved1, g_d_fft, g_d_cross13_accum, fft_size);
+        crossAccumulate<<<grid, block>>>(g_d_fft_saved2, g_d_fft, g_d_cross23_accum, fft_size);
+
+        num_windows++;
+    }
+
+    if (num_windows == 0) return 0;
+
+    normalize<<<grid, block>>>(g_d_pow1, num_windows, fft_size);
+    normalize<<<grid, block>>>(g_d_pow2, num_windows, fft_size);
+    normalize<<<grid, block>>>(g_d_pow3, num_windows, fft_size);
+    normalizeComplex<<<grid, block>>>(g_d_cross_accum,   num_windows, fft_size);
+    normalizeComplex<<<grid, block>>>(g_d_cross13_accum, num_windows, fft_size);
+    normalizeComplex<<<grid, block>>>(g_d_cross23_accum, num_windows, fft_size);
+
+    // --- power spectra output (with fftshift) ---
+    if (flags & FLAG_POWER) {
+        correctGain<<<grid, block>>>(g_d_pow1, 4.0f, fft_size);
+        shiftFFT<<<grid, block>>>(g_d_pow1, g_d_result, fft_size);
+        if (out_pow1) cudaMemcpy(out_pow1, g_d_result, fft_size * sizeof(float), cudaMemcpyDeviceToHost);
+
+        correctGain<<<grid, block>>>(g_d_pow2, 4.0f, fft_size);
+        shiftFFT<<<grid, block>>>(g_d_pow2, g_d_result, fft_size);
+        if (out_pow2) cudaMemcpy(out_pow2, g_d_result, fft_size * sizeof(float), cudaMemcpyDeviceToHost);
+
+        correctGain<<<grid, block>>>(g_d_pow3, 4.0f, fft_size);
+        shiftFFT<<<grid, block>>>(g_d_pow3, g_d_result, fft_size);
+        if (out_pow3) cudaMemcpy(out_pow3, g_d_result, fft_size * sizeof(float), cudaMemcpyDeviceToHost);
+    }
+
+    // --- complex cross-spectra output (with fftshift) ---
+    if (flags & FLAG_CROSS_COMPLEX) {
+        auto copy_shifted_complex = [&](cufftComplex* src, float* real, float* imag) {
+            // shift the complex array, then extract real/imag
+            shiftComplex<<<grid, block>>>(src, g_d_fft, fft_size);
+            extractComplex<<<grid, block>>>(g_d_fft, g_d_accum, g_d_cross_result, fft_size);
+            if (real) cudaMemcpy(real, g_d_accum,        fft_size * sizeof(float), cudaMemcpyDeviceToHost);
+            if (imag) cudaMemcpy(imag, g_d_cross_result, fft_size * sizeof(float), cudaMemcpyDeviceToHost);
+        };
+
+        copy_shifted_complex(g_d_cross_accum,   out_cross12_real, out_cross12_imag);
+        copy_shifted_complex(g_d_cross13_accum, out_cross13_real, out_cross13_imag);
+        copy_shifted_complex(g_d_cross23_accum, out_cross23_real, out_cross23_imag);
+    }
+
+    // --- phases (non-shifted, as phase is independent of shift) ---
+    if (flags & FLAG_CROSS_PHASE) {
+        auto copy_phase = [&](cufftComplex* src, float* phase) {
+            extractPhase<<<grid, block>>>(src, g_d_accum, fft_size);
+            if (phase) cudaMemcpy(phase, g_d_accum, fft_size * sizeof(float), cudaMemcpyDeviceToHost);
+        };
+        copy_phase(g_d_cross_accum,   out_cross12_phase);
+        copy_phase(g_d_cross13_accum, out_cross13_phase);
+        copy_phase(g_d_cross23_accum, out_cross23_phase);
+    }
 
     return 0;
 }

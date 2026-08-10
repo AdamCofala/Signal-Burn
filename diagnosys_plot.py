@@ -1,25 +1,25 @@
 #!/usr/bin/env python3
 """
-Render spectrograms and coherence plots from minute HDF5 snapshots.
-Additionally plot phase vs time from the live processor's unified phase.csv
-(timestamp_ms, cha{ch}_phase_deg, cha{ch}_amplitude - written at up to
-500 Hz, with the oscillator/frequency-offset drift already subtracted
-online before it's written).
+Render spectrograms, cross-spectrum amplitude, and clean phase plots.
 
-New: optionally clean modulation by selecting only the lowest-amplitude
-samples (carrier-only) and averaging their phase in sliding windows,
-then apply a low-pass filter to the cleaned phase.
-Usage:
-    python3 diagnosys_plot.py --input /path/to/minute_h5/ --output ./images/
-    python3 diagnosys_plot.py --phase-csv /path/to/phase.csv --output ./images/ [--clean]
+Inputs:
+  --input        :  directory with minute_*.h5 files (spectrograms + cross-spectra)
+  --phase-csv    :  phase.csv from file_processor (clean phase plots)
+
+
+python3 diagnosys_plot.py --input /pool/signal_storage/output/minute_h5/ --output images/ --freq-downsample 5 --time-downsample 60
+
+
 """
 
 import argparse
 import csv
 import re
 import datetime
+from collections import defaultdict
 from pathlib import Path
 from zoneinfo import ZoneInfo
+from typing import Optional, List, Tuple
 
 import matplotlib
 
@@ -32,7 +32,6 @@ import h5py
 from scipy.signal import butter, filtfilt
 
 # Default settings
-DEFAULT_INPUT_DIR = Path("/pool/signal_storage/output/minute_h5")
 DEFAULT_OUTPUT_DIR = Path("./images")
 DEFAULT_FS = 25_000_000
 DEFAULT_FFT_SIZE = 262144
@@ -42,14 +41,11 @@ DEFAULT_PHASE_DOWNSAMPLE = 1
 DEFAULT_VMIN = 5
 DEFAULT_VMAX = 95
 DEFAULT_DPI = 300
-CLEAN_WINDOW_SEC = 60.0  # default rolling window for clean phase averaging
-CLEAN_PERCENTILE = 5.0  # lowest amplitude percentile to keep
-DEFAULT_FILTER_CUTOFF = 0.007  # Hz, default low-pass cutoff
+CLEAN_WINDOW_SEC = 60.0
+CLEAN_PERCENTILE = 5.0
+DEFAULT_FILTER_CUTOFF = 0.007
 DEFAULT_FILTER_ORDER = 4
 
-# All timestamps in the HDF5/CSV files are UNIX time. Every plot is rendered
-# in Poland local time, regardless of the timezone configured on the machine
-# running this script.
 LOCAL_TZ = ZoneInfo("Europe/Warsaw")
 
 plt.rcParams.update(
@@ -71,7 +67,6 @@ plt.rcParams.update(
 
 
 def butter_lowpass(cutoff, fs, order=4):
-    """Design a digital Butterworth low-pass filter."""
     nyq = 0.5 * fs
     normal_cutoff = cutoff / nyq
     b, a = butter(order, normal_cutoff, btype="low", analog=False)
@@ -79,13 +74,11 @@ def butter_lowpass(cutoff, fs, order=4):
 
 
 def lowpass_filter(data, cutoff, fs, order=4):
-    """Apply a zero-phase low-pass filter to the input signal."""
     b, a = butter_lowpass(cutoff, fs, order)
     return filtfilt(b, a, data)
 
 
-def find_h5_files(input_dir):
-    """Return sorted list of minute HDF5 files."""
+def find_minute_files(input_dir: Path) -> List[Path]:
     input_dir = Path(input_dir)
     files = sorted(
         input_dir.glob("minute_*.h5"),
@@ -94,57 +87,81 @@ def find_h5_files(input_dir):
     return files
 
 
-def read_timestamps(files, time_downsample=1):
-    """Read only the (tiny) timestamp value from each file - cheap even for
-    thousands of files, and lets every per-channel/per-pair load below share
-    the same time axis without re-reading it."""
-    files_to_load = files[::time_downsample]
-    timestamps = np.empty(len(files_to_load), dtype=np.float64)
-    for idx, fpath in enumerate(files_to_load):
-        with h5py.File(fpath, "r") as f:
-            timestamps[idx] = f["timestamps"][0]
-    return timestamps
+def filter_minute_files(
+    files: List[Path],
+    start_ts: Optional[int] = None,
+    end_ts: Optional[int] = None,
+) -> List[Path]:
+    if start_ts is None and end_ts is None:
+        return files
+    filtered = []
+    for f in files:
+        minute_start = int(re.search(r"minute_(\d+)\.h5", f.name).group(1))
+        minute_end = minute_start + 59
+        if start_ts is not None and minute_end < start_ts:
+            continue
+        if end_ts is not None and minute_start > end_ts:
+            continue
+        filtered.append(f)
+    return filtered
 
 
-def load_channel_fft(files, ch, fft_size=DEFAULT_FFT_SIZE, time_downsample=1):
-    """Load only channel `ch`'s FFT data across files - one channel at a
-    time, instead of holding all 3 channels (plus all 3 coherence pairs) in
-    memory simultaneously like the old load_data() did."""
-    files_to_load = files[::time_downsample]
-    n_files = len(files_to_load)
-    arr = np.empty((n_files, fft_size), dtype=np.float32)
-    for idx, fpath in enumerate(files_to_load):
-        try:
-            with h5py.File(fpath, "r") as f:
-                arr[idx] = f[f"cha{ch}/fft"][:].squeeze().astype(np.float32)
-        except FileNotFoundError as e:
-            print(f"Warning: {e}. Filling with NaN for this file.")
-    return arr
+def load_minute_data(
+    files: List[Path],
+    start_ts: Optional[int] = None,
+    end_ts: Optional[int] = None,
+    time_downsample: int = 1,
+) -> Tuple[np.ndarray, dict]:
+    all_timestamps = []
+    data_arrays = defaultdict(list)
 
+    for fp in files:
+        with h5py.File(fp, "r") as f:
+            ts = f["timestamps"][:]
+            mask = np.ones(len(ts), dtype=bool)
+            if start_ts is not None:
+                mask &= ts >= start_ts
+            if end_ts is not None:
+                mask &= ts <= end_ts
+            if not np.any(mask):
+                continue
 
-def load_pair_coherence(files, i, j, fft_size=DEFAULT_FFT_SIZE, time_downsample=1):
-    """Load only the (i, j) coherence pair across files - one pair at a
-    time, for the same reason as load_channel_fft above."""
-    files_to_load = files[::time_downsample]
-    n_files = len(files_to_load)
-    arr = np.empty((n_files, fft_size), dtype=np.float32)
-    for idx, fpath in enumerate(files_to_load):
-        try:
-            with h5py.File(fpath, "r") as f:
-                arr[idx] = f[f"pairs/{i}{j}/coherence"][:].squeeze().astype(np.float32)
-        except FileNotFoundError as e:
-            print(f"Warning: {e}. Filling with NaN for this file.")
-    return arr
+            ts_filtered = ts[mask]
+            all_timestamps.append(ts_filtered)
+
+            def collect_datasets(name, obj):
+                if isinstance(obj, h5py.Dataset) and name != "timestamps":
+                    arr = obj[:]
+                    data_arrays[name].append(arr[mask])
+
+            f.visititems(collect_datasets)
+
+    if not all_timestamps:
+        return np.array([]), {}
+
+    timestamps = np.concatenate(all_timestamps)
+    sort_idx = np.argsort(timestamps)
+    timestamps = timestamps[sort_idx]
+
+    result = {}
+    for key, arrays in data_arrays.items():
+        concat = np.concatenate(arrays, axis=0)
+        result[key] = concat[sort_idx]
+
+    if time_downsample > 1:
+        timestamps = timestamps[::time_downsample]
+        for key in result:
+            result[key] = result[key][::time_downsample]
+
+    return timestamps, result
 
 
 def build_freq_axis(fft_size=DEFAULT_FFT_SIZE, fs=DEFAULT_FS):
-    """Return frequency axis in MHz (after fftshift)."""
     freq = np.fft.fftshift(np.fft.fftfreq(fft_size, d=1 / fs))
     return freq.astype(np.float32) / 1e6
 
 
 def downsample_freq(arr, factor):
-    """Downsample frequency axis by averaging bins."""
     if factor <= 1:
         return arr
     n_freq = arr.shape[-1]
@@ -156,7 +173,6 @@ def downsample_freq(arr, factor):
 def build_time_locator(timestamps):
     timestamps = np.asarray(timestamps)
     span_sec = timestamps[-1] - timestamps[0]
-
     if span_sec <= 60:
         return mdates.SecondLocator(bysecond=range(0, 60, 5), tz=LOCAL_TZ)
     elif span_sec <= 60 * 60:
@@ -166,7 +182,6 @@ def build_time_locator(timestamps):
     elif span_sec <= 12 * 60 * 60:
         return mdates.MinuteLocator(byminute=[0, 30], tz=LOCAL_TZ)
     elif span_sec <= 24 * 60 * 60:
-        # Use 3-hour ticks instead of hourly ticks for longer ranges.
         return mdates.HourLocator(byhour=range(0, 24, 3), tz=LOCAL_TZ)
     elif span_sec <= 3 * 24 * 60 * 60:
         return mdates.HourLocator(byhour=range(0, 24, 3), tz=LOCAL_TZ)
@@ -175,19 +190,11 @@ def build_time_locator(timestamps):
 
 
 def add_date_top_axis(ax, timestamps):
-    """
-    Add a secondary x-axis on top showing the calendar date (Poland local),
-    with a tick at the data's start and at every midnight crossed - so
-    overnight data spanning two dates shows both dates, not only a single
-    "00:00 -> next day" tick.
-    """
     timestamps = np.asarray(timestamps)
     dt_start = datetime.datetime.fromtimestamp(timestamps[0], tz=LOCAL_TZ)
     dt_end = datetime.datetime.fromtimestamp(timestamps[-1], tz=LOCAL_TZ)
-
     tick_locs = [mdates.date2num(dt_start)]
     tick_labels = [dt_start.strftime("%Y-%m-%d")]
-
     day = dt_start.date() + datetime.timedelta(days=1)
     while day <= dt_end.date():
         midnight = datetime.datetime.combine(day, datetime.time.min, tzinfo=LOCAL_TZ)
@@ -195,7 +202,6 @@ def add_date_top_axis(ax, timestamps):
             tick_locs.append(mdates.date2num(midnight))
             tick_labels.append(midnight.strftime("%Y-%m-%d"))
         day += datetime.timedelta(days=1)
-
     top_ax = ax.secondary_xaxis("top")
     top_ax.set_xticks(tick_locs)
     top_ax.set_xticklabels(tick_labels)
@@ -204,7 +210,6 @@ def add_date_top_axis(ax, timestamps):
 
 
 def style_time_axis(ax, timestamps, fmt="%H:%M"):
-    """Shared time-axis treatment: aligned ticks + date top axis."""
     ax.xaxis.set_major_locator(build_time_locator(timestamps))
     ax.xaxis.set_major_formatter(mdates.DateFormatter(fmt, tz=LOCAL_TZ))
     ax.set_xlabel("Time [HH:MM]" if fmt == "%H:%M" else "Time")
@@ -212,12 +217,6 @@ def style_time_axis(ax, timestamps, fmt="%H:%M"):
 
 
 def style_freq_axis(ax, freq_mhz, tick_step_mhz=5.0):
-    """Force the frequency axis out to the true Nyquist edge on both ends,
-    with clean ticks every `tick_step_mhz` MHz (default 5 MHz, was 2.5 -
-    halving the number of y-axis labels on the spectrogram/coherence plots)
-    - the data's last FFT bin falls one bin short of the exact Nyquist
-    frequency, so without this the top-edge (e.g. 25) MHz label doesn't
-    reliably appear."""
     nyquist_mhz = -freq_mhz[0]
     y_ticks = np.arange(freq_mhz[0], nyquist_mhz + 1e-6, tick_step_mhz)
     ax.set_ylim(freq_mhz[0], nyquist_mhz)
@@ -231,10 +230,8 @@ def style_freq_axis(ax, freq_mhz, tick_step_mhz=5.0):
 def plot_spectrogram(
     ax, data, timestamps, freq_mhz, vmin_p=5, vmax_p=95, title="", cmap="jet"
 ):
-    """Plot a 2D spectrogram (dB) with rasterization."""
     db = 10 * np.log10(data + 1e-12)
     vmin, vmax = np.percentile(db, vmin_p), np.percentile(db, vmax_p)
-
     dt = [datetime.datetime.fromtimestamp(t, tz=LOCAL_TZ) for t in timestamps]
     extent = [
         mdates.date2num(dt[0]),
@@ -242,7 +239,6 @@ def plot_spectrogram(
         freq_mhz[0],
         freq_mhz[-1],
     ]
-
     im = ax.imshow(
         db.T,
         aspect="auto",
@@ -254,18 +250,17 @@ def plot_spectrogram(
         interpolation="bilinear",
         rasterized=True,
     )
-
     style_freq_axis(ax, freq_mhz)
     style_time_axis(ax, timestamps)
     ax.set_title(title)
     ax.grid(which="major", axis="both", linestyle=":", linewidth=0.4, alpha=0.4)
     ax.set_box_aspect(9 / 16)
-
     return im
 
 
-def plot_coherence(ax, coh_data, timestamps, freq_mhz, title=""):
-    """Plot coherence with rasterization."""
+def plot_cross_amplitude(ax, data, timestamps, freq_mhz, title=""):
+    db = 10 * np.log10(data + 1e-12)
+    vmin, vmax = np.percentile(db, 5), np.percentile(db, 95)
     dt = [datetime.datetime.fromtimestamp(t, tz=LOCAL_TZ) for t in timestamps]
     extent = [
         mdates.date2num(dt[0]),
@@ -273,94 +268,37 @@ def plot_coherence(ax, coh_data, timestamps, freq_mhz, title=""):
         freq_mhz[0],
         freq_mhz[-1],
     ]
-
     im = ax.imshow(
-        coh_data.T,
+        db.T,
         aspect="auto",
         origin="lower",
         extent=extent,
-        vmin=0,
-        vmax=1,
-        cmap="plasma",
-        interpolation="nearest",
+        vmin=vmin,
+        vmax=vmax,
+        cmap="inferno",
+        interpolation="bilinear",
         rasterized=True,
     )
-
     style_freq_axis(ax, freq_mhz)
     style_time_axis(ax, timestamps)
     ax.set_title(title)
     ax.grid(which="major", axis="both", linestyle=":", linewidth=0.4, alpha=0.4)
     ax.set_box_aspect(9 / 16)
-
     return im
 
 
-# Modulation cleaning for phase traces (carrier-only samples)
-def clean_phase_data(timestamps, phase, amplitude, window_sec=60.0, percentile=10.0):
-    """
-    Select samples with amplitude below the `percentile`-th value in each
-    sliding window of length `window_sec`, then average their phase.
-
-    Parameters
-    timestamps : 1D array (seconds)
-    phase : 1D array (degrees)
-    amplitude : 1D array (positive)
-    window_sec : float
-    percentile : float, 0..100
-
-    Returns
-    times_out : 1D array with window center times
-    phase_out : 1D array with the averaged clean phase per window
-    """
-    t = np.asarray(timestamps, dtype=np.float64)
-    p = np.asarray(phase, dtype=np.float64)
-    a = np.asarray(amplitude, dtype=np.float64)
-
-    if len(t) < 2:
-        return np.array([]), np.array([])
-
-    t_start = t[0]
-    t_end = t[-1]
-    window_starts = np.arange(t_start, t_end, window_sec)
-    times_out = window_starts + window_sec / 2.0
-
-    phase_out = np.full_like(times_out, np.nan, dtype=np.float64)
-
-    idx_left = np.searchsorted(t, window_starts, side="left")
-    idx_right = np.searchsorted(t, window_starts + window_sec, side="right")
-
-    for i in range(len(window_starts)):
-        l = idx_left[i]
-        r = idx_right[i]
-        if r - l < 5:  # minimum number of samples to compute percentile
-            continue
-        amp_win = a[l:r]
-        thresh = np.percentile(amp_win, percentile)
-        mask = amp_win < thresh
-        if not np.any(mask):
-            continue
-        phase_out[i] = np.mean(p[l:r][mask])
-
-    valid = ~np.isnan(phase_out)
-    return times_out[valid], phase_out[valid]
-
-
+# ----------------------------------------------------------------------
+# Phase CSV plotting – always clean phase with raw residual background
+# ----------------------------------------------------------------------
 def plot_phases(
     phase_csv: Path,
     output_dir: Path,
     time_downsample=1,
-    clean=False,
     clean_window_sec=CLEAN_WINDOW_SEC,
     clean_percentile=CLEAN_PERCENTILE,
     filter_cutoff=DEFAULT_FILTER_CUTOFF,
     filter_order=DEFAULT_FILTER_ORDER,
 ):
-    """Read the unified phase CSV and plot the phase for each channel.
-
-    When clean=True, the function computes a carrier-only phase estimate by
-    averaging low-amplitude samples in sliding windows and optionally applies
-    a low-pass filter before saving both the raw and filtered clean CSVs.
-    """
     if not phase_csv.exists():
         print(f"File {phase_csv} not found.")
         return
@@ -399,181 +337,170 @@ def plot_phases(
     times_dt = [
         datetime.datetime.fromtimestamp(ts, tz=LOCAL_TZ) for ts in timestamps_plot
     ]
-    if step > 1:
-        print(
-            f"Phase: rendering every {step}th sample "
-            f"({len(timestamps_plot)}/{len(timestamps_unix)} points) to keep plotting fast."
+
+    print("Computing carrier-only clean phase...")
+    clean_data = {}
+    fs_clean = 1.0 / clean_window_sec
+
+    for ch in range(1, num_channels + 1):
+        raw_phase = np.array(data[ch]["phase"])[plot_idx]
+
+        t_full = timestamps_unix
+        ph_full = np.array(data[ch]["phase"])
+        amp_full = np.array(data[ch]["amplitude"])
+        t_clean, ph_clean = clean_phase_data(
+            t_full,
+            ph_full,
+            amp_full,
+            window_sec=clean_window_sec,
+            percentile=clean_percentile,
         )
 
-    # Standard raw phase plot
-    for ch in range(1, num_channels + 1):
-        phase_vals = np.array(data[ch]["phase"])[plot_idx]
+        ph_clean_filtered = None
+        try:
+            ph_clean_filtered = lowpass_filter(
+                ph_clean, filter_cutoff, fs_clean, filter_order
+            )
+        except ValueError as e:
+            print(
+                f"Channel {ch}: {e}. Skipping low-pass filter, using unfiltered clean phase."
+            )
+            ph_clean_filtered = ph_clean
+
+        clean_data[ch] = (t_clean, ph_clean, ph_clean_filtered)
+
+        if len(t_clean) == 0:
+            print(f"Warning: no clean phase computed for channel {ch}.")
+            continue
 
         fig, ax = plt.subplots(figsize=(16, 9))
         ax.plot(
             times_dt,
-            phase_vals,
-            color="tab:green",
-            linewidth=0.4,
-            alpha=0.85,
+            raw_phase,
+            color="gray",
+            linewidth=0.2,
+            alpha=0.4,
+            label="raw residual",
             rasterized=True,
         )
-        ax.set_ylabel("Phase residual [deg]")
+        dt_clean = [datetime.datetime.fromtimestamp(ts, tz=LOCAL_TZ) for ts in t_clean]
+        label = (
+            f"clean + LP filter (cutoff {filter_cutoff} Hz)"
+            if ph_clean_filtered is not ph_clean
+            else "clean (no filter)"
+        )
+        ax.plot(
+            dt_clean,
+            ph_clean_filtered,
+            color="tab:blue",
+            linewidth=0.8,
+            alpha=0.95,
+            label=label,
+            rasterized=True,
+        )
+        ax.set_ylabel("Phase [deg]")
         ax.axhline(0, color="black", linewidth=0.5, alpha=0.3)
-        ax.set_title(f"Channel {ch} - Phase (oscillator drift removed)")
+        ax.set_title(f"Channel {ch} - Clean Phase (carrier only)")
+        ax.legend(loc="upper right")
         ax.grid(True, alpha=0.3, linestyle=":", linewidth=0.4)
         style_time_axis(ax, timestamps_plot, fmt="%H:%M:%S")
         fig.tight_layout()
-        fig.savefig(output_dir / f"phase_cha{ch}.png", dpi=DEFAULT_DPI)
+        fig.savefig(output_dir / f"phase_cha{ch}_clean.png", dpi=DEFAULT_DPI)
         plt.close(fig)
 
-    # Clean phase (carrier-only) processing
-    if clean:
-        print("Computing carrier-only clean phase...")
-        clean_data = {}
-        # Sampling frequency of the cleaned phase signal
-        fs_clean = 1.0 / clean_window_sec
-
+    # Save CSVs
+    clean_csv_path = output_dir / "phase_clean.csv"
+    with open(clean_csv_path, "w", newline="") as f:
+        writer = csv.writer(f)
+        header = ["timestamp_ms"]
         for ch in range(1, num_channels + 1):
-            t_full = timestamps_unix
-            ph_full = np.array(data[ch]["phase"])
-            amp_full = np.array(data[ch]["amplitude"])
-            t_clean, ph_clean = clean_phase_data(
-                t_full,
-                ph_full,
-                amp_full,
-                window_sec=clean_window_sec,
-                percentile=clean_percentile,
-            )
-            # Low-pass filtering
-            ph_clean_filtered = None
-            if len(ph_clean) > 3 * filter_order:
-                ph_clean_filtered = lowpass_filter(
-                    ph_clean, filter_cutoff, fs_clean, filter_order
-                )
-            else:
-                print(
-                    f"Channel {ch}: too few clean samples ({len(ph_clean)}) "
-                    f"for filter order {filter_order}, skipping filter."
-                )
-                ph_clean_filtered = (
-                    ph_clean  # keep the original values when filtering is not possible
-                )
-
-            clean_data[ch] = (t_clean, ph_clean, ph_clean_filtered)
-
-            if len(t_clean) == 0:
-                print(f"Warning: no clean phase computed for channel {ch}.")
-                continue
-
-            # Plot the raw residual together with the cleaned filtered trace.
-            fig, ax = plt.subplots(figsize=(16, 9))
-            # raw residual
-            ax.plot(
-                times_dt,
-                np.array(data[ch]["phase"])[plot_idx],
-                color="gray",
-                linewidth=0.2,
-                alpha=0.4,
-                label="raw residual",
-                rasterized=True,
-            )
-
-            dt_clean = [
-                datetime.datetime.fromtimestamp(ts, tz=LOCAL_TZ) for ts in t_clean
-            ]
-            # ax.plot(
-            #     dt_clean,
-            #     ph_clean,
-            #     color="tab:blue",
-            #     linestyle="--",
-            #     linewidth=0.8,
-            #     alpha=0.7,
-            #     label=f"clean (lowest {clean_percentile}% amp)",
-            #     rasterized=True,
-            # )
-            ax.plot(
-                dt_clean,
-                ph_clean_filtered,
-                color="tab:blue",
-                linewidth=0.8,
-                alpha=0.95,
-                label=f"clean + LP filter (cutoff {filter_cutoff} Hz)",
-                rasterized=True,
-            )
-            ax.set_ylabel("Phase [deg]")
-            ax.axhline(0, color="black", linewidth=0.5, alpha=0.3)
-            ax.set_title(f"Channel {ch} - Clean Phase (carrier only) + Low‑pass filter")
-            ax.legend(loc="upper right")
-            ax.grid(True, alpha=0.3, linestyle=":", linewidth=0.4)
-            style_time_axis(ax, timestamps_plot, fmt="%H:%M:%S")
-            fig.tight_layout()
-            fig.savefig(output_dir / f"phase_cha{ch}_clean.png", dpi=DEFAULT_DPI)
-            plt.close(fig)
-
-        # Save the unfiltered clean phase export
-        clean_csv_path = output_dir / "phase_clean.csv"
-        with open(clean_csv_path, "w", newline="") as f:
-            writer = csv.writer(f)
-            header = ["timestamp_ms"]
+            header.append(f"cha{ch}_clean_phase_deg")
+        writer.writerow(header)
+        all_times = set()
+        for ch in range(1, num_channels + 1):
+            all_times.update(clean_data[ch][0])
+        all_times = sorted(all_times)
+        for t in all_times:
+            row = [int(t * 1000)]
             for ch in range(1, num_channels + 1):
-                header.append(f"cha{ch}_clean_phase_deg")
-            writer.writerow(header)
-            all_times = set()
+                t_ch, ph_ch, _ = clean_data[ch]
+                if len(t_ch) == 0:
+                    row.append("")
+                    continue
+                idx = np.argmin(np.abs(t_ch - t))
+                if abs(t_ch[idx] - t) < clean_window_sec * 0.5:
+                    row.append(f"{ph_ch[idx]:.6f}")
+                else:
+                    row.append("")
+            writer.writerow(row)
+    print(f"Unfiltered clean phase CSV saved to {clean_csv_path}")
+
+    filt_csv_path = output_dir / "phase_clean_filtered.csv"
+    with open(filt_csv_path, "w", newline="") as f:
+        writer = csv.writer(f)
+        header = ["timestamp_ms"]
+        for ch in range(1, num_channels + 1):
+            header.append(f"cha{ch}_clean_filtered_phase_deg")
+        writer.writerow(header)
+        all_times = set()
+        for ch in range(1, num_channels + 1):
+            all_times.update(clean_data[ch][0])
+        all_times = sorted(all_times)
+        for t in all_times:
+            row = [int(t * 1000)]
             for ch in range(1, num_channels + 1):
-                all_times.update(clean_data[ch][0])
-            all_times = sorted(all_times)
-            for t in all_times:
-                row = [int(t * 1000)]
-                for ch in range(1, num_channels + 1):
-                    t_ch, ph_ch, _ = clean_data[ch]
-                    if len(t_ch) == 0:
-                        row.append("")
-                        continue
-                    idx = np.argmin(np.abs(t_ch - t))
-                    if abs(t_ch[idx] - t) < clean_window_sec * 0.5:
-                        row.append(f"{ph_ch[idx]:.6f}")
-                    else:
-                        row.append("")
-                writer.writerow(row)
-        print(f"Unfiltered clean phase CSV saved to {clean_csv_path}")
-
-        # Save the filtered clean phase export
-        filt_csv_path = output_dir / "phase_clean_filtered.csv"
-        with open(filt_csv_path, "w", newline="") as f:
-            writer = csv.writer(f)
-            header = ["timestamp_ms"]
-            for ch in range(1, num_channels + 1):
-                header.append(f"cha{ch}_clean_filtered_phase_deg")
-            writer.writerow(header)
-            # Use the same window timestamps while writing the filtered values
-            all_times = set()
-            for ch in range(1, num_channels + 1):
-                all_times.update(clean_data[ch][0])
-            all_times = sorted(all_times)
-            for t in all_times:
-                row = [int(t * 1000)]
-                for ch in range(1, num_channels + 1):
-                    t_ch, _, ph_filt = clean_data[ch]
-                    if len(t_ch) == 0:
-                        row.append("")
-                        continue
-                    idx = np.argmin(np.abs(t_ch - t))
-                    if abs(t_ch[idx] - t) < clean_window_sec * 0.5:
-                        row.append(f"{ph_filt[idx]:.6f}")
-                    else:
-                        row.append("")
-                writer.writerow(row)
-        print(f"Filtered clean phase CSV saved to {filt_csv_path}")
-
-        print(f"Clean phase plots saved to {output_dir}")
-
-    print(f"Phase plots saved to {output_dir}")
+                t_ch, _, ph_filt = clean_data[ch]
+                if len(t_ch) == 0:
+                    row.append("")
+                    continue
+                idx = np.argmin(np.abs(t_ch - t))
+                if abs(t_ch[idx] - t) < clean_window_sec * 0.5:
+                    row.append(f"{ph_filt[idx]:.6f}")
+                else:
+                    row.append("")
+            writer.writerow(row)
+    print(f"Filtered clean phase CSV saved to {filt_csv_path}")
+    print(f"Clean phase plots saved to {output_dir}")
 
 
+def clean_phase_data(timestamps, phase, amplitude, window_sec=60.0, percentile=10.0):
+    t = np.asarray(timestamps, dtype=np.float64)
+    p = np.asarray(phase, dtype=np.float64)
+    a = np.asarray(amplitude, dtype=np.float64)
+    if len(t) < 2:
+        return np.array([]), np.array([])
+    t_start = t[0]
+    t_end = t[-1]
+    window_starts = np.arange(t_start, t_end, window_sec)
+    times_out = window_starts + window_sec / 2.0
+    phase_out = np.full_like(times_out, np.nan, dtype=np.float64)
+    idx_left = np.searchsorted(t, window_starts, side="left")
+    idx_right = np.searchsorted(t, window_starts + window_sec, side="right")
+    for i in range(len(window_starts)):
+        l = idx_left[i]
+        r = idx_right[i]
+        if r - l < 5:
+            continue
+        amp_win = a[l:r]
+        thresh = np.percentile(amp_win, percentile)
+        mask = amp_win < thresh
+        if not np.any(mask):
+            continue
+        phase_out[i] = np.mean(p[l:r][mask])
+    valid = ~np.isnan(phase_out)
+    return times_out[valid], phase_out[valid]
+
+
+# ----------------------------------------------------------------------
+# Main entry point
+# ----------------------------------------------------------------------
 def main():
-    parser = argparse.ArgumentParser(description="Render spectrograms and phase plots.")
-    parser.add_argument("--input", type=Path, default=DEFAULT_INPUT_DIR)
+    parser = argparse.ArgumentParser(
+        description="Render spectrograms, cross-spectrum amplitude, and clean phase."
+    )
+    parser.add_argument(
+        "--input", type=Path, default=None, help="Directory with minute_*.h5 files"
+    )
     parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT_DIR)
     parser.add_argument("--fs", type=float, default=DEFAULT_FS)
     parser.add_argument("--fft-size", type=int, default=DEFAULT_FFT_SIZE)
@@ -586,138 +513,156 @@ def main():
         "--phase-time-downsample",
         type=int,
         default=DEFAULT_PHASE_DOWNSAMPLE,
-        help="Render only every Nth sample of the phase CSV, to keep "
-        "plotting fast for long high-rate captures (default: %(default)s, "
-        "i.e. no downsampling)",
-    )
-    # --- clean arguments ---
-    parser.add_argument(
-        "--clean",
-        action="store_true",
-        help="Compute and plot carrier-only (lowest amplitude) phase averaged in windows.",
+        help="Render only every Nth sample of the phase CSV",
     )
     parser.add_argument(
         "--clean-window",
         type=float,
         default=CLEAN_WINDOW_SEC,
-        help="Rolling window length in seconds for clean phase averaging (default: %(default)s).",
+        help="Rolling window length in seconds for clean phase averaging",
     )
     parser.add_argument(
         "--clean-percentile",
         type=float,
         default=CLEAN_PERCENTILE,
-        help="Amplitude percentile threshold for selecting carrier-only samples (default: %(default)s).",
+        help="Amplitude percentile threshold for selecting carrier-only samples",
     )
-    # --- low-pass filter arguments ---
     parser.add_argument(
         "--filter-cutoff",
         type=float,
         default=DEFAULT_FILTER_CUTOFF,
-        help="Low-pass filter cutoff frequency in Hz (default: %(default)s).",
+        help="Low-pass filter cutoff frequency in Hz",
     )
     parser.add_argument(
         "--filter-order",
         type=int,
         default=DEFAULT_FILTER_ORDER,
-        help="Order of the Butterworth low-pass filter (default: %(default)s).",
+        help="Order of the Butterworth low-pass filter",
     )
     parser.add_argument("--dpi", type=int, default=DEFAULT_DPI)
+    parser.add_argument(
+        "--start-ts",
+        type=int,
+        default=None,
+        help="Start Unix timestamp (inclusive) for data filtering",
+    )
+    parser.add_argument(
+        "--end-ts",
+        type=int,
+        default=None,
+        help="End Unix timestamp (inclusive) for data filtering",
+    )
+    parser.add_argument(
+        "--no-spectrograms", action="store_true", help="Skip spectrogram plots"
+    )
+    parser.add_argument(
+        "--no-cross-amplitude",
+        action="store_true",
+        help="Skip cross-spectrum amplitude plots",
+    )
     args = parser.parse_args()
 
     output_dir = Path(args.output)
     output_dir.mkdir(parents=True, exist_ok=True)
 
+    # Phase CSV – always clean
     if args.phase_csv:
         plot_phases(
             args.phase_csv,
             output_dir,
             time_downsample=args.phase_time_downsample,
-            clean=args.clean,
             clean_window_sec=args.clean_window,
             clean_percentile=args.clean_percentile,
             filter_cutoff=args.filter_cutoff,
             filter_order=args.filter_order,
         )
-        if not args.input:
+
+    # Minute-level H5 data
+    if args.input:
+        files = find_minute_files(args.input)
+        files = filter_minute_files(files, args.start_ts, args.end_ts)
+        if not files:
+            print(f"No minute_*.h5 files found in {args.input} matching time range.")
             return
 
-    if not args.input:
-        if not args.phase_csv:
-            print("Nothing to plot. Use --input or --phase-csv.")
-        return
-
-    files = find_h5_files(args.input)
-    if not files:
-        print("No minute_*.h5 files found.")
-        return
-
-    print(f"Loading {len(files)} files...")
-    timestamps = read_timestamps(files, time_downsample=args.time_downsample)
-
-    freq_mhz_full = build_freq_axis(args.fft_size, args.fs)
-    if args.freq_downsample > 1:
-        freq_mhz = downsample_freq(
-            freq_mhz_full[np.newaxis, :], args.freq_downsample
-        ).squeeze()
-        print(
-            f"Frequency axis downsampled by {args.freq_downsample}x "
-            f"({freq_mhz_full.shape[0]} -> {freq_mhz.shape[0]} bins)"
+        print(f"Loading data from {len(files)} minute files...")
+        timestamps, data = load_minute_data(
+            files,
+            start_ts=args.start_ts,
+            end_ts=args.end_ts,
+            time_downsample=args.time_downsample,
         )
-    else:
-        freq_mhz = freq_mhz_full
+        if len(timestamps) == 0:
+            print("No data in selected time range.")
+            return
 
-    # One channel at a time: load only this channel's FFT data, plot it,
-    # save, then drop the array before moving to the next one. Peak memory
-    # is now one channel's worth of data instead of 3 channels + 3
-    # coherence pairs held simultaneously.
-    for ch in range(1, 4):
-        print(f"Loading channel {ch} FFT data...")
-        fft_ch = load_channel_fft(
-            files, ch, fft_size=args.fft_size, time_downsample=args.time_downsample
-        )
+        freq_mhz_full = build_freq_axis(args.fft_size, args.fs)
         if args.freq_downsample > 1:
-            fft_ch = downsample_freq(fft_ch, args.freq_downsample)
+            freq_mhz = downsample_freq(
+                freq_mhz_full[np.newaxis, :], args.freq_downsample
+            ).squeeze()
+        else:
+            freq_mhz = freq_mhz_full
 
-        fig, ax = plt.subplots(figsize=(16, 9))
-        im = plot_spectrogram(
-            ax,
-            fft_ch,
-            timestamps,
-            freq_mhz,
-            vmin_p=args.vmin_percentile,
-            vmax_p=args.vmax_percentile,
-            title=f"Channel {ch} Spectrogram",
-        )
-        plt.colorbar(im, ax=ax, label="Power [dB]")
-        fig.savefig(output_dir / f"channel_{ch}_spectrogram.png", dpi=args.dpi)
-        plt.close(fig)
-        del fft_ch
-        print(f"Channel {ch} spectrogram saved.")
+        # Spectrograms
+        if not args.no_spectrograms:
+            for ch in range(1, 4):
+                key = f"cha{ch}/fft"
+                if key not in data:
+                    print(f"Warning: {key} missing in data, skipping.")
+                    continue
+                fft_data = data[key]
+                if args.freq_downsample > 1:
+                    fft_data = downsample_freq(fft_data, args.freq_downsample)
 
-    # Same one-at-a-time treatment for coherence pairs.
-    for i, j in [(1, 2), (1, 3), (2, 3)]:
-        print(f"Loading coherence {i}-{j} data...")
-        coh_ij = load_pair_coherence(
-            files, i, j, fft_size=args.fft_size, time_downsample=args.time_downsample
-        )
-        if args.freq_downsample > 1:
-            coh_ij = downsample_freq(coh_ij, args.freq_downsample)
+                fig, ax = plt.subplots(figsize=(16, 9))
+                im = plot_spectrogram(
+                    ax,
+                    fft_data,
+                    timestamps,
+                    freq_mhz,
+                    vmin_p=args.vmin_percentile,
+                    vmax_p=args.vmax_percentile,
+                    title=f"Channel {ch} Spectrogram",
+                )
+                plt.colorbar(im, ax=ax, label="Power [dB]")
+                fig.savefig(output_dir / f"channel_{ch}_spectrogram.png", dpi=args.dpi)
+                plt.close(fig)
+                print(f"Channel {ch} spectrogram saved.")
 
-        fig, ax = plt.subplots(figsize=(16, 9))
-        im = plot_coherence(
-            ax,
-            coh_ij,
-            timestamps,
-            freq_mhz,
-            title=f"Coherence: Channel {i} vs Channel {j}",
-        )
-        plt.colorbar(im, ax=ax, label="Coherence")
-        fig.savefig(output_dir / f"coherence_{i}_{j}.png", dpi=args.dpi)
-        plt.close(fig)
-        del coh_ij
-        print(f"Coherence {i}-{j} saved.")
+        # Cross-spectrum amplitude
+        if not args.no_cross_amplitude:
+            for i, j in [(1, 2), (1, 3), (2, 3)]:
+                real_key = f"pairs/{i}{j}/real"
+                imag_key = f"pairs/{i}{j}/imag"
+                if real_key not in data or imag_key not in data:
+                    print(f"Warning: cross data missing for {i}{j}, skipping.")
+                    continue
+                amp = np.sqrt(
+                    data[real_key].astype(np.float64) ** 2
+                    + data[imag_key].astype(np.float64) ** 2
+                ).astype(np.float32)
+                if args.freq_downsample > 1:
+                    amp = downsample_freq(amp, args.freq_downsample)
 
-    print(f"Plots saved to {output_dir}")
+                fig, ax = plt.subplots(figsize=(16, 9))
+                im = plot_cross_amplitude(
+                    ax,
+                    amp,
+                    timestamps,
+                    freq_mhz,
+                    title=f"Cross-spectrum Amplitude: Ch {i} vs Ch {j}",
+                )
+                plt.colorbar(im, ax=ax, label="Amplitude [dB]")
+                fig.savefig(output_dir / f"cross_amplitude_{i}_{j}.png", dpi=args.dpi)
+                plt.close(fig)
+                print(f"Cross amplitude {i}-{j} saved.")
+
+        print(f"Plots saved to {output_dir}")
+
+    elif not args.phase_csv:
+        print("Nothing to plot. Provide --input and/or --phase-csv.")
+        return
 
 
 if __name__ == "__main__":
